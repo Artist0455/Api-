@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from urllib.parse import urlparse, parse_qs
 import time
-import uuid
+import html
 
 app = Flask(__name__)
 CORS(app)
@@ -35,39 +35,95 @@ class InstagramStoryDownloader:
     
     def extract_username(self, url):
         """Extract username from Instagram URL"""
+        # Remove @ symbol if present
+        url = url.replace('@', '')
+        
         patterns = [
             r'instagram\.com/([^/?]+)/?$',
             r'instagram\.com/stories/([^/?]+)',
             r'instagram\.com/([^/?]+)/story/',
-            r'instagram\.com/([^/?]+)/reel/'
+            r'instagram\.com/([^/?]+)/reel/',
+            r'instagram\.com/([^/?]+)/p/',
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, url)
+            match = re.search(pattern, url, re.IGNORECASE)
             if match:
                 username = match.group(1).lower()
-                # Remove common prefixes
-                if username.startswith('@'):
-                    username = username[1:]
+                # Remove query parameters
+                username = username.split('?')[0]
                 return username
         
         # If URL is just a username
         if '/' not in url and '.' not in url:
-            username = url.replace('@', '').lower()
-            return username
+            return url.lower()
         
         return None
     
-    def get_user_id_from_username(self, username):
-        """Get user ID from username"""
+    def get_user_id_public(self, username):
+        """Get user ID from public Instagram page"""
         try:
             profile_url = f"https://www.instagram.com/{username}/"
-            response = self.session.get(profile_url, timeout=10)
+            print(f"Fetching profile: {profile_url}")
+            
+            response = self.session.get(profile_url, timeout=15)
             
             if response.status_code == 200:
                 html_content = response.text
                 
-                # Method 1: Look for profile ID in JSON-LD
+                # Save HTML for debugging
+                with open(f"debug_{username}.html", "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                
+                # Method 1: Look for user ID in shared data
+                shared_data_pattern = r'window\._sharedData\s*=\s*({.*?});'
+                match = re.search(shared_data_pattern, html_content, re.DOTALL)
+                
+                if match:
+                    try:
+                        shared_data = json.loads(match.group(1))
+                        
+                        # Try multiple paths to get user ID
+                        if 'entry_data' in shared_data:
+                            profile_data = shared_data.get('entry_data', {}).get('ProfilePage', [])
+                            if profile_data:
+                                user_data = profile_data[0].get('graphql', {}).get('user', {})
+                                if 'id' in user_data:
+                                    print(f"Found user ID via sharedData: {user_data['id']}")
+                                    return user_data['id']
+                    except Exception as e:
+                        print(f"Error parsing sharedData: {e}")
+                
+                # Method 2: Look for additional data
+                additional_data_pattern = r'window\.__additionalDataLoaded\s*\([^,]+,({.*?})\);'
+                match = re.search(additional_data_pattern, html_content, re.DOTALL)
+                
+                if match:
+                    try:
+                        additional_data = json.loads(match.group(1))
+                        user_data = additional_data.get('graphql', {}).get('user', {})
+                        if 'id' in user_data:
+                            print(f"Found user ID via additionalData: {user_data['id']}")
+                            return user_data['id']
+                    except:
+                        pass
+                
+                # Method 3: Look for profile ID directly in HTML
+                profile_id_patterns = [
+                    r'"profile_id":"(\d+)"',
+                    r'"user_id":"(\d+)"',
+                    r'"owner":{"id":"(\d+)"',
+                    r'profilePage_(\d+)',
+                    r'"id":"(\d+)"',
+                ]
+                
+                for pattern in profile_id_patterns:
+                    matches = re.findall(pattern, html_content)
+                    if matches:
+                        print(f"Found user ID via pattern {pattern}: {matches[0]}")
+                        return matches[0]
+                
+                # Method 4: Look for user ID in JSON-LD
                 json_ld_pattern = r'<script type="application/ld\+json">(.*?)</script>'
                 json_ld_matches = re.findall(json_ld_pattern, html_content, re.DOTALL)
                 
@@ -78,79 +134,56 @@ class InstagramStoryDownloader:
                             url = data['@id']
                             user_id_match = re.search(r'instagram\.com/(\d+)', url)
                             if user_id_match:
+                                print(f"Found user ID via JSON-LD: {user_id_match.group(1)}")
                                 return user_id_match.group(1)
                     except:
                         continue
                 
-                # Method 2: Look for user ID in script tags
-                script_pattern = r'<script[^>]*>(.*?)</script>'
-                script_matches = re.findall(script_pattern, html_content, re.DOTALL)
+                print("Could not find user ID in HTML")
+                return None
+            else:
+                print(f"HTTP Error {response.status_code}")
+                return None
                 
-                for script in script_matches:
-                    # Look for user ID patterns
-                    patterns = [
-                        r'"profile_id":"(\d+)"',
-                        r'"id":"(\d+)"',
-                        r'"user_id":"(\d+)"',
-                        r'"owner":{"id":"(\d+)"',
-                        r'profilePage_(\d+)',
-                    ]
-                    
-                    for pattern in patterns:
-                        matches = re.findall(pattern, script)
-                        if matches:
-                            return matches[0]
-                
-                # Method 3: Look for sharedData
-                shared_data_pattern = r'window\._sharedData\s*=\s*({.*?});'
-                match = re.search(shared_data_pattern, html_content, re.DOTALL)
-                if match:
-                    try:
-                        shared_data = json.loads(match.group(1))
-                        # Navigate through possible data structures
-                        if 'entry_data' in shared_data:
-                            profile_data = shared_data.get('entry_data', {}).get('ProfilePage', [])
-                            if profile_data:
-                                user_data = profile_data[0].get('graphql', {}).get('user', {})
-                                if 'id' in user_data:
-                                    return user_data['id']
-                    except:
-                        pass
-            
-            return None
-            
         except Exception as e:
             print(f"Error getting user ID: {str(e)}")
             return None
     
-    def get_stories_from_api(self, user_id):
-        """Get stories from Instagram API"""
+    def get_stories_via_graphql(self, user_id):
+        """Get stories using GraphQL endpoint"""
         try:
-            # Instagram stories API endpoint
-            stories_url = f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
+            # Instagram's GraphQL endpoint for stories
+            graphql_url = "https://www.instagram.com/graphql/query/"
             
-            headers = {
-                'User-Agent': 'Instagram 269.0.0.18.75 Android (33/12.0; 560dpi; 1440x2894; Google/google; sdk_gphone64_arm64; emulator64_arm64; en_US; 468695184)',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US',
-                'X-IG-App-ID': '936619743392459',
-                'X-Requested-With': 'XMLHttpRequest',
-                'X-ASBD-ID': '198387',
-                'X-IG-WWW-Claim': '0',
-                'Origin': 'https://www.instagram.com',
-                'Referer': f'https://www.instagram.com/',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin',
+            # Query hash for stories (this might need to be updated)
+            query_hash = "de8017ee0a7c9c45ec4260733d81ea31"  # Stories query hash
+            
+            variables = {
+                'reel_ids': [user_id],
+                'tag_names': [],
+                'location_ids': [],
+                'highlight_reel_ids': [],
+                'precomposed_overlay': False,
+                'show_story_viewer_list': True,
+                'story_viewer_fetch_count': 50,
+                'story_viewer_cursor': "",
+                'stories_video_dash_manifest': False
             }
             
-            # Add cookies if available
-            self.session.cookies.update({
-                'ig_did': str(uuid.uuid4()),
-                'ig_nrcb': '1',
-            })
+            params = {
+                'query_hash': query_hash,
+                'variables': json.dumps(variables)
+            }
             
-            response = self.session.get(stories_url, headers=headers, timeout=15)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'X-IG-App-ID': '936619743392459',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://www.instagram.com/',
+                'Accept': 'application/json',
+            }
+            
+            response = self.session.get(graphql_url, params=params, headers=headers, timeout=15)
             
             if response.status_code == 200:
                 try:
@@ -158,284 +191,116 @@ class InstagramStoryDownloader:
                     
                     stories = []
                     
-                    if 'reels' in data and user_id in data['reels']:
-                        reel_data = data['reels'][user_id]
+                    # Parse response for stories
+                    if 'data' in data:
+                        reels_media = data['data'].get('reels_media', [])
                         
-                        if 'items' in reel_data:
-                            for item in reel_data['items']:
-                                story_info = {
-                                    'id': item.get('id'),
-                                    'timestamp': item.get('taken_at_timestamp'),
-                                    'expires_at': item.get('expiring_at_timestamp'),
-                                    'media_type': item.get('media_type'),
-                                }
-                                
-                                # Check media type (1=photo, 2=video)
-                                if item.get('media_type') == 1:  # Photo
-                                    if 'image_versions2' in item:
-                                        candidates = item['image_versions2'].get('candidates', [])
-                                        if candidates:
-                                            # Get the highest quality image
-                                            story_info['url'] = max(candidates, key=lambda x: x.get('width', 0) * x.get('height', 0)).get('url')
-                                            story_info['type'] = 'image'
-                                
-                                elif item.get('media_type') == 2:  # Video
-                                    if 'video_versions' in item:
-                                        videos = item.get('video_versions', [])
-                                        if videos:
-                                            # Get the highest quality video
-                                            story_info['url'] = max(videos, key=lambda x: x.get('width', 0) * x.get('height', 0)).get('url')
-                                            story_info['type'] = 'video'
-                                
-                                # Add story URL if available
-                                if 'url' in story_info:
-                                    story_info['url'] = self.fix_media_url(story_info['url'])
-                                    stories.append(story_info)
+                        for reel in reels_media:
+                            if 'items' in reel:
+                                for item in reel['items']:
+                                    story_info = self.extract_story_info(item)
+                                    if story_info:
+                                        stories.append(story_info)
                     
                     return stories
-                    
                 except json.JSONDecodeError:
                     return []
             
             return []
             
         except Exception as e:
-            print(f"Error in stories API: {str(e)}")
+            print(f"Error in GraphQL method: {str(e)}")
             return []
     
-    def get_stories_from_web(self, username):
-        """Get stories from Instagram web page"""
+    def get_stories_via_embed(self, username):
+        """Get stories via Instagram embed API"""
         try:
-            profile_url = f"https://www.instagram.com/{username}/"
-            response = self.session.get(profile_url, timeout=10)
+            embed_url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Referer': f'https://www.instagram.com/{username}/',
+            }
+            
+            response = self.session.get(embed_url, headers=headers, timeout=15)
             
             if response.status_code == 200:
-                html_content = response.text
-                
-                stories = []
-                
-                # Method 1: Look for stories data in sharedData
-                shared_data_pattern = r'window\._sharedData\s*=\s*({.*?});'
-                match = re.search(shared_data_pattern, html_content, re.DOTALL)
-                
-                if match:
-                    try:
-                        shared_data = json.loads(match.group(1))
-                        
-                        # Try different paths to find stories data
-                        if 'entry_data' in shared_data:
-                            profile_data = shared_data.get('entry_data', {}).get('ProfilePage', [])
-                            if profile_data:
-                                user_data = profile_data[0].get('graphql', {}).get('user', {})
-                                
-                                # Check for stories
-                                if 'reel' in user_data:
-                                    reel_data = user_data['reel']
-                                    if 'edge_reel_media' in reel_data:
-                                        edges = reel_data['edge_reel_media'].get('edges', [])
-                                        for edge in edges:
-                                            node = edge.get('node', {})
-                                            story_info = self.extract_story_from_node(node)
-                                            if story_info:
-                                                stories.append(story_info)
-                    except:
-                        pass
-                
-                # Method 2: Look for stories in script tags
-                if not stories:
-                    script_pattern = r'<script[^>]*>(.*?)</script>'
-                    script_matches = re.findall(script_pattern, html_content, re.DOTALL)
+                try:
+                    data = response.json()
+                    stories = []
                     
-                    for script in script_matches:
-                        # Look for stories data patterns
-                        patterns = [
-                            r'"stories":\[(.*?)\]',
-                            r'"reel":\{.*?"items":\[(.*?)\]',
-                            r'"edge_reel_media":\{"edges":\[(.*?)\]',
-                        ]
-                        
-                        for pattern in patterns:
-                            matches = re.findall(pattern, script, re.DOTALL)
-                            if matches:
-                                try:
-                                    # Try to parse as JSON
-                                    json_str = '[' + matches[0] + ']'
-                                    items = json.loads(json_str)
-                                    
-                                    for item in items:
-                                        story_info = self.extract_story_from_node(item)
-                                        if story_info:
-                                            stories.append(story_info)
-                                    
-                                    if stories:
-                                        break
-                                except:
-                                    continue
-                
-                return stories
+                    # Parse the JSON response
+                    user_data = data.get('graphql', {}).get('user', {})
+                    
+                    if 'reel' in user_data:
+                        reel_data = user_data['reel']
+                        if 'edge_reel_media' in reel_data:
+                            edges = reel_data['edge_reel_media'].get('edges', [])
+                            for edge in edges:
+                                node = edge.get('node', {})
+                                story_info = self.extract_story_from_node(node)
+                                if story_info:
+                                    stories.append(story_info)
+                    
+                    return stories
+                except:
+                    return []
             
             return []
             
         except Exception as e:
-            print(f"Error in web method: {str(e)}")
+            print(f"Error in embed method: {str(e)}")
             return []
     
-    def extract_story_from_node(self, node):
-        """Extract story information from node data"""
+    def get_stories_via_public_api(self, username):
+        """Get stories via public Instagram API"""
         try:
-            story_info = {
-                'id': node.get('id'),
-                'timestamp': node.get('taken_at_timestamp'),
-                'expires_at': node.get('expiring_at_timestamp'),
-                'media_type': node.get('__typename'),
-            }
-            
-            # Check if it's a video or image
-            if 'video_url' in node:
-                story_info['url'] = self.fix_media_url(node['video_url'])
-                story_info['type'] = 'video'
-            elif 'display_url' in node:
-                story_info['url'] = self.fix_media_url(node['display_url'])
-                story_info['type'] = 'image'
-            elif 'display_resources' in node:
-                # Get highest quality image
-                resources = node['display_resources']
-                best_resource = max(resources, key=lambda x: x.get('config_width', 0))
-                story_info['url'] = self.fix_media_url(best_resource.get('src'))
-                story_info['type'] = 'image'
-            
-            return story_info if 'url' in story_info else None
-            
-        except:
-            return None
-    
-    def fix_media_url(self, url):
-        """Fix media URL formatting"""
-        if not url:
-            return None
-        
-        # Fix escaped slashes
-        url = url.replace('\\/', '/').replace('\\\\/', '/')
-        
-        # Fix other escaped characters
-        url = url.replace('\\u0026', '&')
-        
-        # Ensure it starts with http
-        if not url.startswith('http'):
-            if url.startswith('//'):
-                url = 'https:' + url
-            elif url.startswith('/'):
-                url = 'https://www.instagram.com' + url
-        
-        return url
-    
-    def download_stories(self, input_url):
-        """Main function to download stories"""
-        print(f"Processing input: {input_url}")
-        
-        # Get username from input
-        username = self.extract_username(input_url)
-        if not username:
-            return {
-                'success': False,
-                'error': 'Invalid Instagram username or URL'
-            }
-        
-        print(f"Found username: {username}")
-        
-        # Method 1: Try to get user ID and use API
-        print("Trying Method 1: Instagram Stories API...")
-        user_id = self.get_user_id_from_username(username)
-        
-        if user_id:
-            print(f"Found user ID: {user_id}")
-            stories = self.get_stories_from_api(user_id)
-            
-            if stories:
-                print(f"Found {len(stories)} stories via API")
-                return {
-                    'success': True,
-                    'username': username,
-                    'user_id': user_id,
-                    'stories': stories,
-                    'count': len(stories),
-                    'method': 'stories_api'
-                }
-        
-        # Method 2: Try web scraping
-        print("Trying Method 2: Web scraping...")
-        stories = self.get_stories_from_web(username)
-        
-        if stories:
-            print(f"Found {len(stories)} stories via web scraping")
-            return {
-                'success': True,
-                'username': username,
-                'stories': stories,
-                'count': len(stories),
-                'method': 'web_scraping'
-            }
-        
-        # Method 3: Try public stories API
-        print("Trying Method 3: Public API...")
-        public_stories = self.get_public_stories(username)
-        
-        if public_stories:
-            print(f"Found {len(public_stories)} stories via public API")
-            return {
-                'success': True,
-                'username': username,
-                'stories': public_stories,
-                'count': len(public_stories),
-                'method': 'public_api'
-            }
-        
-        # If no stories found
-        print(f"No stories found for {username}")
-        return {
-            'success': False,
-            'error': f'No public stories found for @{username}. The account might be private or have no active stories.',
-            'username': username
-        }
-    
-    def get_public_stories(self, username):
-        """Try alternative public API methods"""
-        try:
-            # Try different endpoints
+            # Try different public API endpoints
             endpoints = [
-                f"https://storiesig.info/api/instagram/stories?url=https://instagram.com/{username}",
-                f"https://www.instagramsave.com/system/action.php?story=https://instagram.com/{username}",
+                f"https://www.instagram.com/{username}/channel/?__a=1",
+                f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
             ]
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'X-IG-App-ID': '936619743392459',
+                'X-Requested-With': 'XMLHttpRequest',
+            }
             
             for endpoint in endpoints:
                 try:
-                    response = self.session.get(endpoint, timeout=10)
+                    response = self.session.get(endpoint, headers=headers, timeout=10)
+                    
                     if response.status_code == 200:
                         try:
                             data = response.json()
                             stories = []
                             
                             # Parse different response formats
-                            if isinstance(data, list):
-                                for item in data:
-                                    if 'video_versions' in item:
-                                        story_info = {
-                                            'url': self.fix_media_url(item['video_versions'][0]['url']),
-                                            'type': 'video',
-                                            'id': item.get('id')
-                                        }
-                                    elif 'image_versions2' in item:
-                                        story_info = {
-                                            'url': self.fix_media_url(item['image_versions2']['candidates'][0]['url']),
-                                            'type': 'image',
-                                            'id': item.get('id')
-                                        }
-                                    else:
-                                        continue
-                                    stories.append(story_info)
+                            if 'data' in data:
+                                user_data = data['data'].get('user', {})
+                                if 'reel' in user_data:
+                                    items = user_data['reel'].get('items', [])
+                                    for item in items:
+                                        story_info = self.extract_story_info(item)
+                                        if story_info:
+                                            stories.append(story_info)
+                            
+                            elif 'graphql' in data:
+                                user_data = data['graphql'].get('user', {})
+                                if 'reel' in user_data:
+                                    items = user_data['reel'].get('items', [])
+                                    for item in items:
+                                        story_info = self.extract_story_info(item)
+                                        if story_info:
+                                            stories.append(story_info)
                             
                             if stories:
                                 return stories
+                                
                         except:
                             continue
                 except:
@@ -444,7 +309,232 @@ class InstagramStoryDownloader:
             return []
             
         except Exception as e:
-            print(f"Error in public API: {str(e)}")
+            print(f"Error in public API method: {str(e)}")
+            return []
+    
+    def extract_story_info(self, item):
+        """Extract story information from item data"""
+        try:
+            story_info = {
+                'id': item.get('id'),
+                'timestamp': item.get('taken_at_timestamp'),
+                'media_type': item.get('__typename'),
+            }
+            
+            # Check media type
+            if item.get('__typename') == 'GraphStoryVideo':
+                # Video story
+                if 'video_resources' in item:
+                    videos = item['video_resources']
+                    if videos:
+                        # Get highest quality video
+                        best_video = max(videos, key=lambda x: x.get('config_height', 0))
+                        story_info['url'] = self.fix_url(best_video.get('src'))
+                        story_info['type'] = 'video'
+                elif 'video_url' in item:
+                    story_info['url'] = self.fix_url(item['video_url'])
+                    story_info['type'] = 'video'
+                    
+            else:
+                # Image story
+                if 'display_resources' in item:
+                    resources = item['display_resources']
+                    if resources:
+                        # Get highest quality image
+                        best_image = max(resources, key=lambda x: x.get('config_width', 0))
+                        story_info['url'] = self.fix_url(best_image.get('src'))
+                        story_info['type'] = 'image'
+                elif 'display_url' in item:
+                    story_info['url'] = self.fix_url(item['display_url'])
+                    story_info['type'] = 'image'
+            
+            return story_info if 'url' in story_info else None
+            
+        except Exception as e:
+            print(f"Error extracting story info: {e}")
+            return None
+    
+    def extract_story_from_node(self, node):
+        """Extract story from node data"""
+        try:
+            story_info = {
+                'id': node.get('id'),
+                'timestamp': node.get('taken_at_timestamp'),
+                'media_type': node.get('__typename'),
+            }
+            
+            if node.get('is_video'):
+                # Video story
+                if 'video_url' in node:
+                    story_info['url'] = self.fix_url(node['video_url'])
+                    story_info['type'] = 'video'
+                elif 'video_versions' in node:
+                    videos = node['video_versions']
+                    if videos:
+                        best_video = max(videos, key=lambda x: x.get('height', 0))
+                        story_info['url'] = self.fix_url(best_video.get('url'))
+                        story_info['type'] = 'video'
+            else:
+                # Image story
+                if 'display_resources' in node:
+                    resources = node['display_resources']
+                    if resources:
+                        best_image = max(resources, key=lambda x: x.get('config_width', 0))
+                        story_info['url'] = self.fix_url(best_image.get('src'))
+                        story_info['type'] = 'image'
+                elif 'display_url' in node:
+                    story_info['url'] = self.fix_url(node['display_url'])
+                    story_info['type'] = 'image'
+            
+            return story_info if 'url' in story_info else None
+            
+        except Exception as e:
+            print(f"Error extracting from node: {e}")
+            return None
+    
+    def fix_url(self, url):
+        """Fix URL formatting"""
+        if not url:
+            return None
+        
+        # Fix escaped slashes
+        url = url.replace('\\/', '/').replace('\\\\/', '/')
+        
+        # Fix other escaped characters
+        url = url.replace('\\u0026', '&').replace('\\u002F', '/')
+        
+        # Ensure it starts with http
+        if not url.startswith('http'):
+            if url.startswith('//'):
+                url = 'https:' + url
+        
+        return url
+    
+    def download_stories(self, input_url):
+        """Main function to download stories"""
+        print(f"\n{'='*50}")
+        print(f"Processing input: {input_url}")
+        
+        # Get username from input
+        username = self.extract_username(input_url)
+        if not username:
+            return {
+                'success': False,
+                'error': 'Invalid Instagram username or URL format'
+            }
+        
+        print(f"Username extracted: {username}")
+        
+        # Method 1: Get user ID and try GraphQL
+        print("\nMethod 1: Getting user ID...")
+        user_id = self.get_user_id_public(username)
+        
+        if user_id:
+            print(f"Found user ID: {user_id}")
+            print("Trying GraphQL method...")
+            stories = self.get_stories_via_graphql(user_id)
+            
+            if stories:
+                print(f"✓ Found {len(stories)} stories via GraphQL")
+                return {
+                    'success': True,
+                    'username': username,
+                    'user_id': user_id,
+                    'stories': stories,
+                    'count': len(stories),
+                    'method': 'graphql'
+                }
+        
+        # Method 2: Try embed API
+        print("\nMethod 2: Trying embed API...")
+        stories = self.get_stories_via_embed(username)
+        
+        if stories:
+            print(f"✓ Found {len(stories)} stories via embed API")
+            return {
+                'success': True,
+                'username': username,
+                'stories': stories,
+                'count': len(stories),
+                'method': 'embed_api'
+            }
+        
+        # Method 3: Try public API
+        print("\nMethod 3: Trying public API...")
+        stories = self.get_stories_via_public_api(username)
+        
+        if stories:
+            print(f"✓ Found {len(stories)} stories via public API")
+            return {
+                'success': True,
+                'username': username,
+                'stories': stories,
+                'count': len(stories),
+                'method': 'public_api'
+            }
+        
+        # Method 4: Try direct HTML parsing as last resort
+        print("\nMethod 4: Trying direct HTML parsing...")
+        stories = self.get_stories_from_html(username)
+        
+        if stories:
+            print(f"✓ Found {len(stories)} stories via HTML parsing")
+            return {
+                'success': True,
+                'username': username,
+                'stories': stories,
+                'count': len(stories),
+                'method': 'html_parsing'
+            }
+        
+        # If all methods fail
+        print(f"\n✗ No stories found for @{username}")
+        return {
+            'success': False,
+            'error': f'No public stories found for @{username}. Possible reasons:\n1. Account is private\n2. No active stories at the moment\n3. Instagram API restrictions\n4. Account doesn\'t exist',
+            'username': username,
+            'note': 'Try checking manually if the account has public stories visible on Instagram.'
+        }
+    
+    def get_stories_from_html(self, username):
+        """Direct HTML parsing as fallback"""
+        try:
+            profile_url = f"https://www.instagram.com/{username}/"
+            response = self.session.get(profile_url, timeout=15)
+            
+            if response.status_code == 200:
+                html_content = response.text
+                stories = []
+                
+                # Look for story URLs in HTML
+                story_patterns = [
+                    r'"video_url":"([^"]+)"',
+                    r'"display_url":"([^"]+)"',
+                    r'"src":"([^"]+\.(mp4|jpg|jpeg|png))"',
+                    r'https://[^"]+\.(mp4|jpg|jpeg|png)[^"]*',
+                ]
+                
+                for pattern in story_patterns:
+                    matches = re.findall(pattern, html_content)
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            url = match[0]
+                        else:
+                            url = match
+                        
+                        if 'stories' in url.lower() or 'story' in url.lower():
+                            story_info = {
+                                'url': self.fix_url(url),
+                                'type': 'video' if url.endswith('.mp4') else 'image',
+                            }
+                            stories.append(story_info)
+                
+                return stories[:10]  # Return max 10 stories
+            
+            return []
+            
+        except Exception as e:
+            print(f"Error in HTML parsing: {e}")
             return []
 
 # Initialize downloader
@@ -456,7 +546,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Instagram Story Downloader - WORKING ✓</title>
+    <title>Instagram Story Downloader - PUBLIC ACCOUNTS ONLY</title>
     <style>
         * {
             margin: 0;
@@ -472,7 +562,7 @@ HTML_TEMPLATE = '''
         }
         
         .container {
-            max-width: 1200px;
+            max-width: 1000px;
             margin: 0 auto;
             background: white;
             border-radius: 20px;
@@ -483,21 +573,20 @@ HTML_TEMPLATE = '''
         .header {
             background: linear-gradient(45deg, #405DE6, #833AB4, #C13584, #E1306C, #FD1D1D);
             color: white;
-            padding: 40px 30px;
+            padding: 30px;
             text-align: center;
         }
         
         .header h1 {
-            font-size: 2.5rem;
+            font-size: 2.2rem;
             margin-bottom: 10px;
             font-weight: 800;
         }
         
         .header p {
-            font-size: 1.1rem;
+            font-size: 1rem;
             opacity: 0.9;
-            max-width: 600px;
-            margin: 0 auto;
+            margin: 5px 0;
         }
         
         .badge {
@@ -511,6 +600,17 @@ HTML_TEMPLATE = '''
             margin-top: 10px;
         }
         
+        .warning {
+            background: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            margin: 0 30px;
+            border-radius: 10px;
+            border-left: 4px solid #ffc107;
+            text-align: center;
+            font-weight: 600;
+        }
+        
         .content {
             padding: 30px;
         }
@@ -522,14 +622,14 @@ HTML_TEMPLATE = '''
         .input-group {
             display: flex;
             gap: 15px;
-            margin-bottom: 15px;
+            margin-bottom: 20px;
         }
         
         input[type="text"] {
             flex: 1;
-            padding: 18px 25px;
-            border: 3px solid #e0e0e0;
-            border-radius: 12px;
+            padding: 15px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
             font-size: 16px;
             transition: all 0.3s;
         }
@@ -537,25 +637,30 @@ HTML_TEMPLATE = '''
         input[type="text"]:focus {
             outline: none;
             border-color: #E1306C;
-            box-shadow: 0 0 0 4px rgba(225, 48, 108, 0.1);
+            box-shadow: 0 0 0 3px rgba(225, 48, 108, 0.1);
         }
         
         button {
             background: linear-gradient(45deg, #E1306C, #833AB4);
             color: white;
             border: none;
-            padding: 18px 40px;
-            border-radius: 12px;
+            padding: 15px 30px;
+            border-radius: 10px;
             font-size: 16px;
-            font-weight: 700;
+            font-weight: 600;
             cursor: pointer;
             transition: all 0.3s;
-            min-width: 180px;
+            min-width: 150px;
         }
         
         button:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 20px rgba(225, 48, 108, 0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(225, 48, 108, 0.2);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
         }
         
         .loader {
@@ -565,13 +670,13 @@ HTML_TEMPLATE = '''
         }
         
         .spinner {
-            width: 50px;
-            height: 50px;
-            border: 5px solid #f3f3f3;
-            border-top: 5px solid #E1306C;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #E1306C;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 20px;
+            margin: 0 auto 15px;
         }
         
         @keyframes spin {
@@ -582,10 +687,10 @@ HTML_TEMPLATE = '''
         .result {
             display: none;
             background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            padding: 30px;
+            padding: 25px;
             border-radius: 15px;
-            margin-top: 25px;
-            border: 3px solid #e0e0e0;
+            margin-top: 20px;
+            border: 2px solid #e0e0e0;
             animation: fadeIn 0.5s;
         }
         
@@ -594,57 +699,55 @@ HTML_TEMPLATE = '''
             to { opacity: 1; transform: translateY(0); }
         }
         
-        .result h3 {
-            color: #E1306C;
-            font-size: 1.8rem;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .error {
+            display: none;
+            background: linear-gradient(135deg, #fee 0%, #fdd 100%);
+            color: #d33;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 20px;
+            border-left: 5px solid #d33;
+            font-weight: 600;
+            white-space: pre-line;
         }
         
         .profile-info {
             background: white;
             padding: 20px;
             border-radius: 12px;
-            margin-bottom: 25px;
+            margin-bottom: 20px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.05);
             text-align: center;
         }
         
         .profile-info h4 {
             color: #333;
-            font-size: 1.5rem;
+            font-size: 1.4rem;
             margin-bottom: 10px;
         }
         
-        .profile-info p {
-            color: #666;
-            margin-bottom: 5px;
-        }
-        
-        .stories-grid {
+        .stories-container {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px;
-            margin-top: 25px;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
         }
         
         .story-card {
             background: white;
-            border-radius: 15px;
+            border-radius: 12px;
             overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             transition: transform 0.3s;
         }
         
         .story-card:hover {
-            transform: translateY(-5px);
+            transform: translateY(-3px);
         }
         
         .story-media {
             width: 100%;
-            height: 300px;
+            height: 250px;
             overflow: hidden;
             position: relative;
         }
@@ -662,57 +765,68 @@ HTML_TEMPLATE = '''
             right: 10px;
             background: rgba(0,0,0,0.7);
             color: white;
-            padding: 5px 10px;
-            border-radius: 20px;
-            font-size: 0.8rem;
+            padding: 4px 8px;
+            border-radius: 15px;
+            font-size: 0.7rem;
         }
         
         .story-actions {
-            padding: 15px;
+            padding: 12px;
             text-align: center;
         }
         
         .story-actions a {
             display: inline-block;
-            background: linear-gradient(45deg, #E1306C, #833AB4);
+            background: linear-gradient(45deg, #28a745, #20c997);
             color: white;
             text-decoration: none;
-            padding: 10px 20px;
-            border-radius: 8px;
+            padding: 8px 16px;
+            border-radius: 6px;
             font-weight: 600;
+            font-size: 0.9rem;
             transition: all 0.3s;
         }
         
         .story-actions a:hover {
-            background: linear-gradient(45deg, #833AB4, #E1306C);
+            background: linear-gradient(45deg, #20c997, #28a745);
             transform: translateY(-2px);
+        }
+        
+        .no-stories {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .no-stories i {
+            font-size: 3rem;
+            color: #ccc;
+            margin-bottom: 15px;
         }
         
         .actions {
             display: flex;
-            gap: 15px;
-            margin-top: 25px;
+            gap: 10px;
+            margin-top: 20px;
             flex-wrap: wrap;
             justify-content: center;
         }
         
         .btn {
-            padding: 15px 25px;
-            border-radius: 10px;
+            padding: 12px 20px;
+            border-radius: 8px;
             text-decoration: none;
             font-weight: 600;
             text-align: center;
-            min-width: 150px;
-            display: flex;
+            min-width: 140px;
+            display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 10px;
+            gap: 8px;
             transition: all 0.3s;
-        }
-        
-        .btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+            border: none;
+            cursor: pointer;
+            font-size: 0.9rem;
         }
         
         .btn-download-all {
@@ -723,66 +837,48 @@ HTML_TEMPLATE = '''
         .btn-new {
             background: linear-gradient(45deg, #fd7e14, #ff922b);
             color: white;
-            border: none;
-            cursor: pointer;
         }
         
-        .error {
-            display: none;
-            background: linear-gradient(135deg, #fee 0%, #fdd 100%);
-            color: #d33;
-            padding: 20px;
-            border-radius: 12px;
-            margin-top: 20px;
-            border-left: 5px solid #d33;
-            font-weight: 600;
-        }
-        
-        .instructions {
-            background: #f0f8ff;
-            padding: 20px;
-            border-radius: 12px;
-            margin-top: 30px;
-        }
-        
-        .instructions h4 {
-            color: #405DE6;
-            margin-bottom: 15px;
-        }
-        
-        .instructions ol {
-            margin-left: 20px;
-            color: #555;
-        }
-        
-        .instructions li {
-            margin-bottom: 10px;
-        }
-        
-        .example-urls {
-            background: #e7f4e4;
+        .examples {
+            background: #f8f9fa;
             padding: 15px;
             border-radius: 10px;
             margin-top: 20px;
         }
         
-        .example-urls h4 {
-            color: #28a745;
+        .examples h4 {
+            color: #555;
             margin-bottom: 10px;
+            font-size: 0.9rem;
         }
         
-        .url-example {
+        .example-item {
+            display: inline-block;
             background: white;
-            padding: 10px;
-            border-radius: 8px;
-            margin: 10px 0;
-            font-family: monospace;
-            color: #555;
+            padding: 8px 12px;
+            margin: 5px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            color: #E1306C;
+            cursor: pointer;
+            border: 1px solid #e0e0e0;
+        }
+        
+        .example-item:hover {
+            background: #f8f8f8;
         }
         
         @media (max-width: 768px) {
+            .container {
+                border-radius: 15px;
+            }
+            
+            .header {
+                padding: 20px;
+            }
+            
             .header h1 {
-                font-size: 2rem;
+                font-size: 1.8rem;
             }
             
             .input-group {
@@ -794,8 +890,12 @@ HTML_TEMPLATE = '''
                 min-width: auto;
             }
             
-            .stories-grid {
-                grid-template-columns: 1fr;
+            .stories-container {
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            }
+            
+            .story-media {
+                height: 200px;
             }
             
             .actions {
@@ -813,108 +913,100 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1><i class="fab fa-instagram"></i> Instagram Story Downloader</h1>
-            <p>Download Public Instagram Stories • Working 2024 • No Login Required</p>
-            <div class="badge">✓ PUBLIC STORIES ONLY</div>
+            <p>Download Public Instagram Stories • No Login Required</p>
+            <div class="badge">PUBLIC ACCOUNTS ONLY</div>
+        </div>
+        
+        <div class="warning">
+            <i class="fas fa-exclamation-triangle"></i> 
+            This tool works only with PUBLIC Instagram accounts. Private accounts require login.
         </div>
         
         <div class="content">
             <div class="input-section">
-                <h2 style="color: #333; margin-bottom: 20px; font-size: 1.6rem;">Download Instagram Stories</h2>
+                <h2 style="color: #333; margin-bottom: 15px; font-size: 1.4rem;">Enter Instagram Details</h2>
                 
                 <div class="input-group">
-                    <input type="text" id="urlInput" placeholder="Enter Instagram username or profile URL...">
-                    <button onclick="downloadStories()">
+                    <input type="text" id="urlInput" placeholder="Enter username (e.g., instagram) or profile URL...">
+                    <button onclick="downloadStories()" id="downloadBtn">
                         <i class="fas fa-download"></i> Get Stories
                     </button>
                 </div>
                 
-                <div class="instructions">
-                    <h4><i class="fas fa-info-circle"></i> How to Use:</h4>
-                    <ol>
-                        <li>Enter Instagram username (e.g., <code>instagram</code>)</li>
-                        <li>OR enter profile URL (e.g., <code>https://instagram.com/instagram</code>)</li>
-                        <li>Click "Get Stories" to fetch public stories</li>
-                        <li>Download individual stories or all at once</li>
-                    </ol>
-                </div>
-                
-                <div class="example-urls">
-                    <h4><i class="fas fa-lightbulb"></i> Examples:</h4>
-                    <div class="url-example">instagram</div>
-                    <div class="url-example">@instagram</div>
-                    <div class="url-example">https://instagram.com/instagram</div>
-                    <div class="url-example">https://www.instagram.com/instagram/stories/</div>
+                <div class="examples">
+                    <h4>Try these public accounts:</h4>
+                    <div class="example-item" onclick="useExample('instagram')">instagram</div>
+                    <div class="example-item" onclick="useExample('natgeo')">natgeo</div>
+                    <div class="example-item" onclick="useExample('nasa')">nasa</div>
+                    <div class="example-item" onclick="useExample('netflix')">netflix</div>
+                    <div class="example-item" onclick="useExample('instagram')">@instagram</div>
                 </div>
             </div>
             
             <div class="loader" id="loader">
                 <div class="spinner"></div>
-                <p style="font-size: 1.1rem; color: #666;">Fetching Instagram stories...</p>
-                <p id="statusText" style="margin-top: 10px; color: #888; font-size: 0.9rem;"></p>
+                <p style="font-size: 1rem; color: #666; margin-top: 10px;">Fetching stories...</p>
+                <p id="statusText" style="margin-top: 5px; color: #888; font-size: 0.85rem;"></p>
             </div>
             
             <div class="error" id="error"></div>
             
             <div class="result" id="result">
-                <h3><i class="fas fa-check-circle"></i> Stories Found!</h3>
-                
-                <div class="profile-info" id="profileInfo">
-                    <!-- Profile info will be inserted here -->
-                </div>
-                
-                <div id="storiesContainer">
-                    <!-- Stories will be inserted here -->
-                </div>
-                
-                <div class="actions">
-                    <button onclick="downloadAllStories()" class="btn btn-download-all">
-                        <i class="fas fa-download"></i> Download All Stories
-                    </button>
-                    <button onclick="resetForm()" class="btn btn-new">
-                        <i class="fas fa-redo"></i> Try Another
-                    </button>
-                </div>
+                <!-- Results will be inserted here -->
             </div>
         </div>
     </div>
     
     <script>
         let currentStoriesData = null;
+        let isProcessing = false;
+        
+        function useExample(username) {
+            document.getElementById('urlInput').value = username;
+            downloadStories();
+        }
         
         async function downloadStories() {
+            if (isProcessing) return;
+            
             const input = document.getElementById('urlInput').value.trim();
             const errorDiv = document.getElementById('error');
             const loader = document.getElementById('loader');
-            const result = document.getElementById('result');
+            const resultDiv = document.getElementById('result');
+            const downloadBtn = document.getElementById('downloadBtn');
             
             // Reset
             errorDiv.style.display = 'none';
-            result.style.display = 'none';
+            resultDiv.style.display = 'none';
             currentStoriesData = null;
+            isProcessing = true;
+            downloadBtn.disabled = true;
+            downloadBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
             
             // Validate input
             if (!input) {
                 showError('Please enter Instagram username or URL');
+                resetButton();
                 return;
             }
             
             // Show loader
             loader.style.display = 'block';
             
-            // Update status messages
+            // Status messages
             const statusMessages = [
-                'Connecting to Instagram...',
-                'Fetching profile information...',
-                'Checking for stories...',
-                'Extracting story data...',
-                'Preparing downloads...'
+                'Checking account...',
+                'Fetching profile data...',
+                'Looking for stories...',
+                'Extracting media...',
+                'Almost done...'
             ];
             
             let messageIndex = 0;
             const statusInterval = setInterval(() => {
                 document.getElementById('statusText').textContent = statusMessages[messageIndex];
                 messageIndex = (messageIndex + 1) % statusMessages.length;
-            }, 1200);
+            }, 1000);
             
             try {
                 // Make API request
@@ -934,74 +1026,85 @@ HTML_TEMPLATE = '''
                 loader.style.display = 'none';
                 
                 if (data.success) {
-                    // Store stories data
                     currentStoriesData = data;
-                    
-                    // Update profile info
-                    const profileInfo = document.getElementById('profileInfo');
-                    profileInfo.innerHTML = `
-                        <h4>@${data.username}</h4>
-                        ${data.user_id ? `<p><strong>User ID:</strong> ${data.user_id}</p>` : ''}
-                        <p><strong>Found Stories:</strong> ${data.count}</p>
-                        <p><strong>Method:</strong> <span style="color: #E1306C; font-weight: 700;">${data.method}</span></p>
-                    `;
-                    
-                    // Update stories grid
-                    const storiesContainer = document.getElementById('storiesContainer');
-                    if (data.stories && data.stories.length > 0) {
-                        storiesContainer.innerHTML = `
-                            <h4 style="color: #333; margin-bottom: 15px;">Available Stories:</h4>
-                            <div class="stories-grid" id="storiesGrid"></div>
-                        `;
-                        
-                        const storiesGrid = document.getElementById('storiesGrid');
-                        
-                        data.stories.forEach((story, index) => {
-                            const storyCard = document.createElement('div');
-                            storyCard.className = 'story-card';
-                            
-                            const mediaElement = story.type === 'video' 
-                                ? `<video controls style="width: 100%; height: 100%; object-fit: cover;">
-                                        <source src="${story.url}" type="video/mp4">
-                                        Your browser does not support video playback.
-                                   </video>`
-                                : `<img src="${story.url}" alt="Story ${index + 1}" style="width: 100%; height: 100%; object-fit: cover;">`;
-                            
-                            storyCard.innerHTML = `
-                                <div class="story-media">
-                                    ${mediaElement}
-                                    <div class="story-type">
-                                        ${story.type === 'video' ? '<i class="fas fa-video"></i> Video' : '<i class="fas fa-image"></i> Image'}
-                                    </div>
-                                </div>
-                                <div class="story-actions">
-                                    <a href="${story.url}" download="instagram_story_${data.username}_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}" target="_blank">
-                                        <i class="fas fa-download"></i> Download ${story.type}
-                                    </a>
-                                </div>
-                            `;
-                            
-                            storiesGrid.appendChild(storyCard);
-                        });
-                    } else {
-                        storiesContainer.innerHTML = '<p style="color: #666; text-align: center;">No stories found.</p>';
-                    }
-                    
-                    // Show result
-                    result.style.display = 'block';
-                    
-                    // Auto-scroll to result
-                    result.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    
+                    displayResults(data);
                 } else {
-                    showError(data.error || 'Failed to fetch stories. The account might be private or have no active stories.');
+                    showError(data.error || 'Failed to fetch stories. Make sure the account is public.');
                 }
                 
             } catch (error) {
                 clearInterval(statusInterval);
                 loader.style.display = 'none';
                 showError('Network error: ' + error.message);
+            } finally {
+                resetButton();
             }
+        }
+        
+        function displayResults(data) {
+            const resultDiv = document.getElementById('result');
+            
+            let storiesHTML = '';
+            
+            if (data.stories && data.stories.length > 0) {
+                storiesHTML = `
+                    <div class="profile-info">
+                        <h4><i class="fab fa-instagram"></i> @${data.username}</h4>
+                        <p><strong>Stories Found:</strong> ${data.count} | <strong>Method:</strong> ${data.method}</p>
+                    </div>
+                    
+                    <div class="stories-container" id="storiesGrid">
+                        ${data.stories.map((story, index) => `
+                            <div class="story-card">
+                                <div class="story-media">
+                                    ${story.type === 'video' 
+                                        ? `<video controls style="width: 100%; height: 100%; object-fit: cover;">
+                                            <source src="${story.url}" type="video/mp4">
+                                          </video>`
+                                        : `<img src="${story.url}" alt="Story ${index + 1}" 
+                                             onerror="this.src='https://via.placeholder.com/300x300?text=Image+Not+Available'" 
+                                             style="width: 100%; height: 100%; object-fit: cover;">`
+                                    }
+                                    <div class="story-type">
+                                        ${story.type === 'video' ? '<i class="fas fa-video"></i> Video' : '<i class="fas fa-image"></i> Image'}
+                                    </div>
+                                </div>
+                                <div class="story-actions">
+                                    <a href="${story.url}" 
+                                       download="instagram_story_${data.username}_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}" 
+                                       target="_blank">
+                                        <i class="fas fa-download"></i> Download ${story.type}
+                                    </a>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    <div class="actions">
+                        <button onclick="downloadAllStories()" class="btn btn-download-all">
+                            <i class="fas fa-download"></i> Download All (${data.count})
+                        </button>
+                        <button onclick="resetForm()" class="btn btn-new">
+                            <i class="fas fa-redo"></i> Try Another
+                        </button>
+                    </div>
+                `;
+            } else {
+                storiesHTML = `
+                    <div class="no-stories">
+                        <i class="fas fa-images"></i>
+                        <h3>No Stories Found</h3>
+                        <p>@${data.username} doesn't have any active stories right now.</p>
+                        <button onclick="resetForm()" class="btn btn-new" style="margin-top: 20px;">
+                            <i class="fas fa-search"></i> Try Another Account
+                        </button>
+                    </div>
+                `;
+            }
+            
+            resultDiv.innerHTML = storiesHTML;
+            resultDiv.style.display = 'block';
+            resultDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
         
         function showError(message) {
@@ -1010,27 +1113,29 @@ HTML_TEMPLATE = '''
                 <i class="fas fa-exclamation-triangle"></i> ${message}
             `;
             errorDiv.style.display = 'block';
+            errorDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
             
-            // Auto-hide error after 8 seconds
             setTimeout(() => {
                 errorDiv.style.display = 'none';
-            }, 8000);
+            }, 10000);
         }
         
         function downloadAllStories() {
-            if (currentStoriesData && currentStoriesData.stories) {
-                currentStoriesData.stories.forEach((story, index) => {
+            if (!currentStoriesData || !currentStoriesData.stories) return;
+            
+            currentStoriesData.stories.forEach((story, index) => {
+                setTimeout(() => {
                     const link = document.createElement('a');
                     link.href = story.url;
-                    link.download = `instagram_story_${currentStoriesData.username}_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}`;
+                    link.download = `instagram_${currentStoriesData.username}_story_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}`;
                     link.target = '_blank';
                     document.body.appendChild(link);
                     link.click();
                     document.body.removeChild(link);
-                });
-                
-                alert(`✓ Started downloading ${currentStoriesData.stories.length} stories!`);
-            }
+                }, index * 500); // Stagger downloads
+            });
+            
+            alert(`Downloading ${currentStoriesData.stories.length} stories... Check your downloads folder.`);
         }
         
         function resetForm() {
@@ -1041,9 +1146,16 @@ HTML_TEMPLATE = '''
             currentStoriesData = null;
         }
         
+        function resetButton() {
+            const downloadBtn = document.getElementById('downloadBtn');
+            downloadBtn.disabled = false;
+            downloadBtn.innerHTML = '<i class="fas fa-download"></i> Get Stories';
+            isProcessing = false;
+        }
+        
         // Enter key support
         document.getElementById('urlInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
+            if (e.key === 'Enter' && !isProcessing) {
                 downloadStories();
             }
         });
@@ -1051,10 +1163,10 @@ HTML_TEMPLATE = '''
         // Auto-focus on input
         document.getElementById('urlInput').focus();
         
-        // Add sample username for testing
+        // Add sample for testing
         setTimeout(() => {
             document.getElementById('urlInput').value = 'instagram';
-        }, 1000);
+        }, 500);
     </script>
 </body>
 </html>
@@ -1081,12 +1193,16 @@ def api_stories():
                 'error': 'URL or username is required'
             }), 400
         
-        # Download stories using our story downloader
+        # Download stories
         result = story_downloader.download_stories(url)
         
         return jsonify(result)
     
     except Exception as e:
+        import traceback
+        print(f"Server error: {e}")
+        print(traceback.format_exc())
+        
         return jsonify({
             'success': False,
             'error': f'Server error: {str(e)}'
@@ -1098,11 +1214,11 @@ def health():
     return jsonify({
         'status': 'healthy',
         'service': 'Instagram Story Downloader',
-        'version': '1.0.0',
-        'feature': 'Public Stories Only',
-        'last_test': 'SUCCESS'
+        'version': '2.0.0',
+        'feature': 'Public Accounts Only',
+        'note': 'For private accounts, login is required'
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=True, threaded=True)

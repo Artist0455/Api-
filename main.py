@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from urllib.parse import urlparse, parse_qs
 import time
-import base64
 
 app = Flask(__name__)
 CORS(app)
@@ -1311,4 +1310,3 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-[file content end]

@@ -1,3 +1,5 @@
+[file name]: main.py
+[file content begin]
 import os
 import re
 import json
@@ -6,12 +8,12 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from urllib.parse import urlparse, parse_qs
 import time
-import html
+import base64
 
 app = Flask(__name__)
 CORS(app)
 
-class InstagramStoryDownloader:
+class InstagramSelfDownloader:
     def __init__(self):
         self.session = requests.Session()
         self.setup_headers()
@@ -33,512 +35,509 @@ class InstagramStoryDownloader:
             'Cache-Control': 'max-age=0',
         })
     
-    def extract_username(self, url):
-        """Extract username from Instagram URL"""
-        # Remove @ symbol if present
-        url = url.replace('@', '')
-        
+    def get_instagram_page(self, url):
+        """Fetch Instagram page content"""
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            print(f"Error fetching page: {str(e)}")
+            return None
+    
+    def extract_shortcode(self, url):
+        """Extract shortcode from Instagram URL"""
         patterns = [
-            r'instagram\.com/([^/?]+)/?$',
+            r'instagram\.com/reel/([^/?]+)',
+            r'instagram\.com/p/([^/?]+)',
             r'instagram\.com/stories/([^/?]+)',
-            r'instagram\.com/([^/?]+)/story/',
-            r'instagram\.com/([^/?]+)/reel/',
-            r'instagram\.com/([^/?]+)/p/',
+            r'instagram\.com/tv/([^/?]+)',
+            r'reel/([^/?]+)',
+            r'p/([^/?]+)',
+            r'stories/([^/?]+)',
+            r'tv/([^/?]+)'
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, url, re.IGNORECASE)
+            match = re.search(pattern, url)
             if match:
-                username = match.group(1).lower()
-                # Remove query parameters
-                username = username.split('?')[0]
-                return username
+                return match.group(1)
+        return None
+    
+    def find_highest_quality_video(self, video_data):
+        """Find highest quality video from available video URLs"""
+        if not video_data:
+            return None
         
-        # If URL is just a username
-        if '/' not in url and '.' not in url:
-            return url.lower()
+        # If video_data is a string (single URL)
+        if isinstance(video_data, str):
+            return video_data
+        
+        # If video_data is a list
+        if isinstance(video_data, list):
+            # Sort by quality indicators
+            quality_order = ['1080', '720', '480', '360', '240']
+            for quality in quality_order:
+                for video in video_data:
+                    if isinstance(video, str) and quality in video:
+                        return video
+            
+            # Return first video if no quality found
+            for video in video_data:
+                if isinstance(video, str):
+                    return video
+        
+        # If video_data is a dict with quality options
+        if isinstance(video_data, dict):
+            # Check for specific quality keys
+            quality_keys = ['hd', 'high', '1080', '720', 'sd', 'low']
+            for key in quality_keys:
+                if key in video_data:
+                    return video_data[key]
+            
+            # Return first value
+            for key, value in video_data.items():
+                if value:
+                    return value
         
         return None
     
-    def get_user_id_public(self, username):
-        """Get user ID from public Instagram page"""
+    def find_highest_quality_image(self, image_data):
+        """Find highest quality image from available image URLs"""
+        if not image_data:
+            return None
+        
+        # If image_data is a string (single URL)
+        if isinstance(image_data, str):
+            return image_data
+        
+        # If image_data is a list
+        if isinstance(image_data, list):
+            # Sort by size indicators
+            size_order = ['1080', '2048', '1536', '1280', '1024', '800', '640', '480', '320']
+            for size in size_order:
+                for img in image_data:
+                    if isinstance(img, str) and size in img:
+                        return img
+            
+            # Return largest image by looking at dimensions in URL
+            max_size = 0
+            best_image = None
+            for img in image_data:
+                if isinstance(img, str):
+                    # Try to extract dimensions from URL
+                    size_match = re.search(r'(\d{3,4})x(\d{3,4})', img)
+                    if size_match:
+                        size = int(size_match.group(1)) * int(size_match.group(2))
+                        if size > max_size:
+                            max_size = size
+                            best_image = img
+            
+            if best_image:
+                return best_image
+            
+            # Return first image
+            for img in image_data:
+                if isinstance(img, str):
+                    return img
+        
+        # If image_data is a dict
+        if isinstance(image_data, dict):
+            # Check for specific size keys
+            size_keys = ['hd', 'high', '1080', '720', 'large', 'medium', 'small']
+            for key in size_keys:
+                if key in image_data:
+                    return image_data[key]
+            
+            # Return first value
+            for key, value in image_data.items():
+                if value:
+                    return value
+        
+        return None
+    
+    def extract_from_shared_data(self, html_content):
+        """Extract media data from Instagram's shared data"""
         try:
-            profile_url = f"https://www.instagram.com/{username}/"
-            print(f"Fetching profile: {profile_url}")
+            # Look for the shared data script
+            pattern = r'<script[^>]*>window\._sharedData\s*=\s*({.*?});</script>'
+            match = re.search(pattern, html_content, re.DOTALL)
             
-            response = self.session.get(profile_url, timeout=15)
+            if match:
+                shared_data = json.loads(match.group(1))
+                
+                # Navigate through the data structure
+                post_data = None
+                
+                # Check entry data
+                if 'entry_data' in shared_data:
+                    for key, data in shared_data['entry_data'].items():
+                        if isinstance(data, list) and len(data) > 0:
+                            post_data = data[0]
+                            break
+                
+                if not post_data:
+                    return None
+                
+                # Extract from GraphQL
+                if 'graphql' in post_data:
+                    media_data = post_data['graphql'].get('shortcode_media', {})
+                    return self.extract_from_graphql(media_data)
+                
+                # Extract from PostPage
+                elif 'PostPage' in post_data:
+                    for page in post_data['PostPage']:
+                        if 'graphql' in page:
+                            media_data = page['graphql'].get('shortcode_media', {})
+                            return self.extract_from_graphql(media_data)
             
-            if response.status_code == 200:
-                html_content = response.text
-                
-                # Save HTML for debugging
-                with open(f"debug_{username}.html", "w", encoding="utf-8") as f:
-                    f.write(html_content)
-                
-                # Method 1: Look for user ID in shared data
-                shared_data_pattern = r'window\._sharedData\s*=\s*({.*?});'
-                match = re.search(shared_data_pattern, html_content, re.DOTALL)
-                
-                if match:
-                    try:
-                        shared_data = json.loads(match.group(1))
-                        
-                        # Try multiple paths to get user ID
-                        if 'entry_data' in shared_data:
-                            profile_data = shared_data.get('entry_data', {}).get('ProfilePage', [])
-                            if profile_data:
-                                user_data = profile_data[0].get('graphql', {}).get('user', {})
-                                if 'id' in user_data:
-                                    print(f"Found user ID via sharedData: {user_data['id']}")
-                                    return user_data['id']
-                    except Exception as e:
-                        print(f"Error parsing sharedData: {e}")
-                
-                # Method 2: Look for additional data
-                additional_data_pattern = r'window\.__additionalDataLoaded\s*\([^,]+,({.*?})\);'
-                match = re.search(additional_data_pattern, html_content, re.DOTALL)
-                
-                if match:
-                    try:
-                        additional_data = json.loads(match.group(1))
-                        user_data = additional_data.get('graphql', {}).get('user', {})
-                        if 'id' in user_data:
-                            print(f"Found user ID via additionalData: {user_data['id']}")
-                            return user_data['id']
-                    except:
-                        pass
-                
-                # Method 3: Look for profile ID directly in HTML
-                profile_id_patterns = [
-                    r'"profile_id":"(\d+)"',
-                    r'"user_id":"(\d+)"',
-                    r'"owner":{"id":"(\d+)"',
-                    r'profilePage_(\d+)',
-                    r'"id":"(\d+)"',
-                ]
-                
-                for pattern in profile_id_patterns:
-                    matches = re.findall(pattern, html_content)
-                    if matches:
-                        print(f"Found user ID via pattern {pattern}: {matches[0]}")
-                        return matches[0]
-                
-                # Method 4: Look for user ID in JSON-LD
-                json_ld_pattern = r'<script type="application/ld\+json">(.*?)</script>'
-                json_ld_matches = re.findall(json_ld_pattern, html_content, re.DOTALL)
-                
-                for json_ld in json_ld_matches:
-                    try:
-                        data = json.loads(json_ld)
-                        if isinstance(data, dict) and '@id' in data:
-                            url = data['@id']
-                            user_id_match = re.search(r'instagram\.com/(\d+)', url)
-                            if user_id_match:
-                                print(f"Found user ID via JSON-LD: {user_id_match.group(1)}")
-                                return user_id_match.group(1)
-                    except:
-                        continue
-                
-                print("Could not find user ID in HTML")
-                return None
-            else:
-                print(f"HTTP Error {response.status_code}")
-                return None
-                
+            return None
+            
         except Exception as e:
-            print(f"Error getting user ID: {str(e)}")
+            print(f"Error extracting shared data: {str(e)}")
             return None
     
-    def get_stories_via_graphql(self, user_id):
-        """Get stories using GraphQL endpoint"""
+    def extract_from_graphql(self, media_data):
+        """Extract media from GraphQL data structure"""
         try:
-            # Instagram's GraphQL endpoint for stories
-            graphql_url = "https://www.instagram.com/graphql/query/"
-            
-            # Query hash for stories (this might need to be updated)
-            query_hash = "de8017ee0a7c9c45ec4260733d81ea31"  # Stories query hash
-            
-            variables = {
-                'reel_ids': [user_id],
-                'tag_names': [],
-                'location_ids': [],
-                'highlight_reel_ids': [],
-                'precomposed_overlay': False,
-                'show_story_viewer_list': True,
-                'story_viewer_fetch_count': 50,
-                'story_viewer_cursor': "",
-                'stories_video_dash_manifest': False
+            result = {
+                'type': None,
+                'urls': [],
+                'is_video': False,
+                'is_carousel': False,
+                'caption': None,
+                'dimensions': None,
+                'display_url': None
             }
             
-            params = {
-                'query_hash': query_hash,
-                'variables': json.dumps(variables)
-            }
+            if not media_data:
+                return None
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'X-IG-App-ID': '936619743392459',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://www.instagram.com/',
-                'Accept': 'application/json',
-            }
+            # Get media type
+            result['type'] = media_data.get('__typename')
+            result['is_video'] = media_data.get('is_video', False)
+            result['caption'] = media_data.get('edge_media_to_caption', {}).get('edges', [{}])[0].get('node', {}).get('text', '')
+            result['dimensions'] = media_data.get('dimensions', {})
             
-            response = self.session.get(graphql_url, params=params, headers=headers, timeout=15)
+            # Handle single image/video
+            if result['type'] == 'GraphImage':
+                # Get display URL
+                display_url = media_data.get('display_url')
+                if display_url:
+                    result['display_url'] = display_url
+                    result['urls'].append({
+                        'url': display_url,
+                        'type': 'image',
+                        'quality': 'display'
+                    })
+                
+                # Get high quality images
+                if 'display_resources' in media_data:
+                    for resource in media_data['display_resources']:
+                        if 'src' in resource:
+                            result['urls'].append({
+                                'url': resource['src'],
+                                'type': 'image',
+                                'quality': f"{resource.get('config_width', 0)}x{resource.get('config_height', 0)}"
+                            })
+                
+                # Get original image
+                if 'thumbnail_resources' in media_data:
+                    for resource in media_data['thumbnail_resources']:
+                        if 'src' in resource and 'original' in resource['src']:
+                            result['urls'].append({
+                                'url': resource['src'],
+                                'type': 'image',
+                                'quality': 'original'
+                            })
             
-            if response.status_code == 200:
-                try:
-                    data = response.json()
+            # Handle video
+            elif result['type'] == 'GraphVideo':
+                result['is_video'] = True
+                
+                # Get video URL
+                video_url = media_data.get('video_url')
+                if video_url:
+                    result['display_url'] = video_url
+                    result['urls'].append({
+                        'url': video_url,
+                        'type': 'video',
+                        'quality': 'video_url'
+                    })
+                
+                # Get display URL for thumbnail
+                display_url = media_data.get('display_url')
+                if display_url:
+                    result['urls'].append({
+                        'url': display_url,
+                        'type': 'image',
+                        'quality': 'thumbnail'
+                    })
+            
+            # Handle carousel (multiple images/videos)
+            elif result['type'] == 'GraphSidecar':
+                result['is_carousel'] = True
+                
+                edges = media_data.get('edge_sidecar_to_children', {}).get('edges', [])
+                for edge in edges:
+                    node = edge.get('node', {})
+                    node_type = node.get('__typename')
                     
-                    stories = []
-                    
-                    # Parse response for stories
-                    if 'data' in data:
-                        reels_media = data['data'].get('reels_media', [])
+                    if node_type == 'GraphImage':
+                        # Get display URL
+                        display_url = node.get('display_url')
+                        if display_url:
+                            result['urls'].append({
+                                'url': display_url,
+                                'type': 'image',
+                                'quality': 'display'
+                            })
                         
-                        for reel in reels_media:
-                            if 'items' in reel:
-                                for item in reel['items']:
-                                    story_info = self.extract_story_info(item)
-                                    if story_info:
-                                        stories.append(story_info)
+                        # Get high quality images
+                        if 'display_resources' in node:
+                            for resource in node['display_resources']:
+                                if 'src' in resource:
+                                    result['urls'].append({
+                                        'url': resource['src'],
+                                        'type': 'image',
+                                        'quality': f"{resource.get('config_width', 0)}x{resource.get('config_height', 0)}"
+                                    })
                     
-                    return stories
-                except json.JSONDecodeError:
-                    return []
+                    elif node_type == 'GraphVideo':
+                        # Get video URL
+                        video_url = node.get('video_url')
+                        if video_url:
+                            result['urls'].append({
+                                'url': video_url,
+                                'type': 'video',
+                                'quality': 'video_url'
+                            })
             
-            return []
+            return result if result['urls'] else None
             
         except Exception as e:
-            print(f"Error in GraphQL method: {str(e)}")
-            return []
+            print(f"Error extracting from GraphQL: {str(e)}")
+            return None
     
-    def get_stories_via_embed(self, username):
-        """Get stories via Instagram embed API"""
+    def extract_from_alternative_sources(self, html_content):
+        """Extract media from alternative sources in HTML"""
         try:
-            embed_url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json',
-                'Referer': f'https://www.instagram.com/{username}/',
-            }
-            
-            response = self.session.get(embed_url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    stories = []
-                    
-                    # Parse the JSON response
-                    user_data = data.get('graphql', {}).get('user', {})
-                    
-                    if 'reel' in user_data:
-                        reel_data = user_data['reel']
-                        if 'edge_reel_media' in reel_data:
-                            edges = reel_data['edge_reel_media'].get('edges', [])
-                            for edge in edges:
-                                node = edge.get('node', {})
-                                story_info = self.extract_story_from_node(node)
-                                if story_info:
-                                    stories.append(story_info)
-                    
-                    return stories
-                except:
-                    return []
-            
-            return []
-            
-        except Exception as e:
-            print(f"Error in embed method: {str(e)}")
-            return []
-    
-    def get_stories_via_public_api(self, username):
-        """Get stories via public Instagram API"""
-        try:
-            # Try different public API endpoints
-            endpoints = [
-                f"https://www.instagram.com/{username}/channel/?__a=1",
-                f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
-                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            # Look for JavaScript data
+            patterns = [
+                r'"display_url":"([^"]+)"',
+                r'"displayUrl":"([^"]+)"',
+                r'"video_url":"([^"]+)"',
+                r'"videoUrl":"([^"]+)"',
+                r'"thumbnail_src":"([^"]+)"',
+                r'"thumbnailSrc":"([^"]+)"',
+                r'"src":"([^"]+\.(?:jpg|jpeg|png|mp4)[^"]*)"',
             ]
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json',
-                'X-IG-App-ID': '936619743392459',
-                'X-Requested-With': 'XMLHttpRequest',
-            }
+            for pattern in patterns:
+                matches = re.findall(pattern, html_content)
+                for match in matches:
+                    if match and ('instagram.com' in match or 'cdninstagram.com' in match):
+                        return match
             
-            for endpoint in endpoints:
-                try:
-                    response = self.session.get(endpoint, headers=headers, timeout=10)
-                    
-                    if response.status_code == 200:
-                        try:
-                            data = response.json()
-                            stories = []
-                            
-                            # Parse different response formats
-                            if 'data' in data:
-                                user_data = data['data'].get('user', {})
-                                if 'reel' in user_data:
-                                    items = user_data['reel'].get('items', [])
-                                    for item in items:
-                                        story_info = self.extract_story_info(item)
-                                        if story_info:
-                                            stories.append(story_info)
-                            
-                            elif 'graphql' in data:
-                                user_data = data['graphql'].get('user', {})
-                                if 'reel' in user_data:
-                                    items = user_data['reel'].get('items', [])
-                                    for item in items:
-                                        story_info = self.extract_story_info(item)
-                                        if story_info:
-                                            stories.append(story_info)
-                            
-                            if stories:
-                                return stories
-                                
-                        except:
-                            continue
-                except:
-                    continue
-            
-            return []
+            return None
             
         except Exception as e:
-            print(f"Error in public API method: {str(e)}")
-            return []
-    
-    def extract_story_info(self, item):
-        """Extract story information from item data"""
-        try:
-            story_info = {
-                'id': item.get('id'),
-                'timestamp': item.get('taken_at_timestamp'),
-                'media_type': item.get('__typename'),
-            }
-            
-            # Check media type
-            if item.get('__typename') == 'GraphStoryVideo':
-                # Video story
-                if 'video_resources' in item:
-                    videos = item['video_resources']
-                    if videos:
-                        # Get highest quality video
-                        best_video = max(videos, key=lambda x: x.get('config_height', 0))
-                        story_info['url'] = self.fix_url(best_video.get('src'))
-                        story_info['type'] = 'video'
-                elif 'video_url' in item:
-                    story_info['url'] = self.fix_url(item['video_url'])
-                    story_info['type'] = 'video'
-                    
-            else:
-                # Image story
-                if 'display_resources' in item:
-                    resources = item['display_resources']
-                    if resources:
-                        # Get highest quality image
-                        best_image = max(resources, key=lambda x: x.get('config_width', 0))
-                        story_info['url'] = self.fix_url(best_image.get('src'))
-                        story_info['type'] = 'image'
-                elif 'display_url' in item:
-                    story_info['url'] = self.fix_url(item['display_url'])
-                    story_info['type'] = 'image'
-            
-            return story_info if 'url' in story_info else None
-            
-        except Exception as e:
-            print(f"Error extracting story info: {e}")
+            print(f"Error extracting from alternative sources: {str(e)}")
             return None
     
-    def extract_story_from_node(self, node):
-        """Extract story from node data"""
-        try:
-            story_info = {
-                'id': node.get('id'),
-                'timestamp': node.get('taken_at_timestamp'),
-                'media_type': node.get('__typename'),
+    def extract_high_quality_media(self, html_content):
+        """Extract high quality media using multiple methods"""
+        # Method 1: Extract from shared data (best quality)
+        print("Trying Method 1: Shared Data...")
+        graphql_data = self.extract_from_shared_data(html_content)
+        
+        if graphql_data and graphql_data['urls']:
+            print(f"Found media via GraphQL: {len(graphql_data['urls'])} items")
+            return graphql_data
+        
+        # Method 2: Extract from meta tags
+        print("Trying Method 2: Meta Tags...")
+        
+        # Look for Open Graph meta tags (usually good quality)
+        meta_patterns = {
+            'og:image': r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"',
+            'og:video': r'<meta[^>]*property="og:video"[^>]*content="([^"]+)"',
+            'og:video:secure_url': r'<meta[^>]*property="og:video:secure_url"[^>]*content="([^"]+)"',
+            'twitter:image': r'<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"',
+            'twitter:player:stream': r'<meta[^>]*name="twitter:player:stream"[^>]*content="([^"]+)"',
+        }
+        
+        media_urls = []
+        is_video = False
+        
+        for meta_type, pattern in meta_patterns.items():
+            matches = re.findall(pattern, html_content)
+            for match in matches:
+                if match:
+                    media_type = 'video' if 'video' in meta_type else 'image'
+                    if 'video' in meta_type:
+                        is_video = True
+                    
+                    media_urls.append({
+                        'url': match,
+                        'type': media_type,
+                        'quality': meta_type
+                    })
+        
+        if media_urls:
+            return {
+                'type': 'MetaTags',
+                'urls': media_urls,
+                'is_video': is_video,
+                'is_carousel': False,
+                'caption': None,
+                'dimensions': None,
+                'display_url': media_urls[0]['url'] if media_urls else None
             }
-            
-            if node.get('is_video'):
-                # Video story
-                if 'video_url' in node:
-                    story_info['url'] = self.fix_url(node['video_url'])
-                    story_info['type'] = 'video'
-                elif 'video_versions' in node:
-                    videos = node['video_versions']
-                    if videos:
-                        best_video = max(videos, key=lambda x: x.get('height', 0))
-                        story_info['url'] = self.fix_url(best_video.get('url'))
-                        story_info['type'] = 'video'
-            else:
-                # Image story
-                if 'display_resources' in node:
-                    resources = node['display_resources']
-                    if resources:
-                        best_image = max(resources, key=lambda x: x.get('config_width', 0))
-                        story_info['url'] = self.fix_url(best_image.get('src'))
-                        story_info['type'] = 'image'
-                elif 'display_url' in node:
-                    story_info['url'] = self.fix_url(node['display_url'])
-                    story_info['type'] = 'image'
-            
-            return story_info if 'url' in story_info else None
-            
-        except Exception as e:
-            print(f"Error extracting from node: {e}")
-            return None
+        
+        # Method 3: Extract from JSON-LD
+        print("Trying Method 3: JSON-LD...")
+        json_ld_pattern = r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>'
+        matches = re.findall(json_ld_pattern, html_content, re.DOTALL)
+        
+        for json_str in matches:
+            try:
+                data = json.loads(json_str)
+                if isinstance(data, dict) and 'video' in data:
+                    video_data = data['video']
+                    if isinstance(video_data, dict):
+                        video_url = video_data.get('contentUrl') or video_data.get('embedUrl')
+                        if video_url:
+                            return {
+                                'type': 'JSON-LD',
+                                'urls': [{
+                                    'url': video_url,
+                                    'type': 'video',
+                                    'quality': 'json-ld'
+                                }],
+                                'is_video': True,
+                                'is_carousel': False,
+                                'caption': None,
+                                'dimensions': None,
+                                'display_url': video_url
+                            }
+            except:
+                continue
+        
+        return None
     
-    def fix_url(self, url):
-        """Fix URL formatting"""
+    def get_best_quality_url(self, media_data):
+        """Get the best quality URL from media data"""
+        if not media_data or not media_data.get('urls'):
+            return None
+        
+        urls = media_data['urls']
+        
+        # For videos, prioritize video URLs
+        if media_data.get('is_video'):
+            video_urls = [u for u in urls if u['type'] == 'video']
+            if video_urls:
+                # Sort by quality indicators
+                quality_order = ['video_url', 'hd', '1080', '720', '480', '360']
+                for quality in quality_order:
+                    for url_info in video_urls:
+                        if quality in url_info['quality'].lower():
+                            return url_info['url']
+                
+                # Return first video URL
+                return video_urls[0]['url']
+        
+        # For images, prioritize display URLs
+        image_urls = [u for u in urls if u['type'] == 'image']
+        if image_urls:
+            # Sort by quality indicators
+            quality_order = ['display', 'original', '2048', '1536', '1080', 'hd', 'high', 'large']
+            for quality in quality_order:
+                for url_info in image_urls:
+                    if quality in url_info['quality'].lower():
+                        return url_info['url']
+            
+            # Return first image URL
+            return image_urls[0]['url']
+        
+        # Return first URL
+        return urls[0]['url'] if urls else None
+    
+    def fix_url_formatting(self, url):
+        """Fix URL formatting issues"""
         if not url:
             return None
         
-        # Fix escaped slashes
+        # Fix escaped characters
         url = url.replace('\\/', '/').replace('\\\\/', '/')
-        
-        # Fix other escaped characters
         url = url.replace('\\u0026', '&').replace('\\u002F', '/')
+        url = url.replace('\\u003D', '=').replace('\\u003F', '?')
         
-        # Ensure it starts with http
-        if not url.startswith('http'):
-            if url.startswith('//'):
-                url = 'https:' + url
+        # Ensure proper protocol
+        if url.startswith('//'):
+            url = 'https:' + url
+        elif not url.startswith('http'):
+            url = 'https://' + url
         
         return url
     
-    def download_stories(self, input_url):
-        """Main function to download stories"""
-        print(f"\n{'='*50}")
-        print(f"Processing input: {input_url}")
+    def download_media(self, url):
+        """Main function to download media"""
+        print(f"Processing URL: {url}")
         
-        # Get username from input
-        username = self.extract_username(input_url)
-        if not username:
+        # Get HTML content
+        html_content = self.get_instagram_page(url)
+        if not html_content:
             return {
                 'success': False,
-                'error': 'Invalid Instagram username or URL format'
+                'error': 'Failed to fetch Instagram page'
             }
         
-        print(f"Username extracted: {username}")
+        # Extract media data
+        media_data = self.extract_high_quality_media(html_content)
         
-        # Method 1: Get user ID and try GraphQL
-        print("\nMethod 1: Getting user ID...")
-        user_id = self.get_user_id_public(username)
-        
-        if user_id:
-            print(f"Found user ID: {user_id}")
-            print("Trying GraphQL method...")
-            stories = self.get_stories_via_graphql(user_id)
+        if media_data:
+            # Get best quality URL
+            best_url = self.get_best_quality_url(media_data)
             
-            if stories:
-                print(f"✓ Found {len(stories)} stories via GraphQL")
+            if best_url:
+                best_url = self.fix_url_formatting(best_url)
+                
                 return {
                     'success': True,
-                    'username': username,
-                    'user_id': user_id,
-                    'stories': stories,
-                    'count': len(stories),
-                    'method': 'graphql'
+                    'media_type': 'video' if media_data['is_video'] else 'image',
+                    'media_url': best_url,
+                    'all_urls': media_data['urls'],
+                    'is_carousel': media_data.get('is_carousel', False),
+                    'caption': media_data.get('caption'),
+                    'dimensions': media_data.get('dimensions'),
+                    'method': media_data.get('type', 'unknown')
                 }
         
-        # Method 2: Try embed API
-        print("\nMethod 2: Trying embed API...")
-        stories = self.get_stories_via_embed(username)
+        # Fallback: Try alternative extraction
+        print("Trying fallback methods...")
+        fallback_url = self.extract_from_alternative_sources(html_content)
         
-        if stories:
-            print(f"✓ Found {len(stories)} stories via embed API")
+        if fallback_url:
+            fallback_url = self.fix_url_formatting(fallback_url)
+            
+            # Determine media type
+            is_video = '.mp4' in fallback_url.lower()
+            
             return {
                 'success': True,
-                'username': username,
-                'stories': stories,
-                'count': len(stories),
-                'method': 'embed_api'
+                'media_type': 'video' if is_video else 'image',
+                'media_url': fallback_url,
+                'method': 'fallback'
             }
         
-        # Method 3: Try public API
-        print("\nMethod 3: Trying public API...")
-        stories = self.get_stories_via_public_api(username)
-        
-        if stories:
-            print(f"✓ Found {len(stories)} stories via public API")
-            return {
-                'success': True,
-                'username': username,
-                'stories': stories,
-                'count': len(stories),
-                'method': 'public_api'
-            }
-        
-        # Method 4: Try direct HTML parsing as last resort
-        print("\nMethod 4: Trying direct HTML parsing...")
-        stories = self.get_stories_from_html(username)
-        
-        if stories:
-            print(f"✓ Found {len(stories)} stories via HTML parsing")
-            return {
-                'success': True,
-                'username': username,
-                'stories': stories,
-                'count': len(stories),
-                'method': 'html_parsing'
-            }
-        
-        # If all methods fail
-        print(f"\n✗ No stories found for @{username}")
         return {
             'success': False,
-            'error': f'No public stories found for @{username}. Possible reasons:\n1. Account is private\n2. No active stories at the moment\n3. Instagram API restrictions\n4. Account doesn\'t exist',
-            'username': username,
-            'note': 'Try checking manually if the account has public stories visible on Instagram.'
+            'error': 'Could not extract media. The post might be private or require login.'
         }
-    
-    def get_stories_from_html(self, username):
-        """Direct HTML parsing as fallback"""
-        try:
-            profile_url = f"https://www.instagram.com/{username}/"
-            response = self.session.get(profile_url, timeout=15)
-            
-            if response.status_code == 200:
-                html_content = response.text
-                stories = []
-                
-                # Look for story URLs in HTML
-                story_patterns = [
-                    r'"video_url":"([^"]+)"',
-                    r'"display_url":"([^"]+)"',
-                    r'"src":"([^"]+\.(mp4|jpg|jpeg|png))"',
-                    r'https://[^"]+\.(mp4|jpg|jpeg|png)[^"]*',
-                ]
-                
-                for pattern in story_patterns:
-                    matches = re.findall(pattern, html_content)
-                    for match in matches:
-                        if isinstance(match, tuple):
-                            url = match[0]
-                        else:
-                            url = match
-                        
-                        if 'stories' in url.lower() or 'story' in url.lower():
-                            story_info = {
-                                'url': self.fix_url(url),
-                                'type': 'video' if url.endswith('.mp4') else 'image',
-                            }
-                            stories.append(story_info)
-                
-                return stories[:10]  # Return max 10 stories
-            
-            return []
-            
-        except Exception as e:
-            print(f"Error in HTML parsing: {e}")
-            return []
 
 # Initialize downloader
-story_downloader = InstagramStoryDownloader()
+downloader = InstagramSelfDownloader()
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -546,7 +545,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Instagram Story Downloader - PUBLIC ACCOUNTS ONLY</title>
+    <title>Instagram Downloader - High Quality ✓</title>
     <style>
         * {
             margin: 0;
@@ -556,7 +555,7 @@ HTML_TEMPLATE = '''
         }
         
         body {
-            background: linear-gradient(135deg, #833AB4 0%, #E1306C 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
         }
@@ -573,20 +572,21 @@ HTML_TEMPLATE = '''
         .header {
             background: linear-gradient(45deg, #405DE6, #833AB4, #C13584, #E1306C, #FD1D1D);
             color: white;
-            padding: 30px;
+            padding: 40px 30px;
             text-align: center;
         }
         
         .header h1 {
-            font-size: 2.2rem;
+            font-size: 2.5rem;
             margin-bottom: 10px;
             font-weight: 800;
         }
         
         .header p {
-            font-size: 1rem;
+            font-size: 1.1rem;
             opacity: 0.9;
-            margin: 5px 0;
+            max-width: 600px;
+            margin: 0 auto;
         }
         
         .badge {
@@ -600,17 +600,6 @@ HTML_TEMPLATE = '''
             margin-top: 10px;
         }
         
-        .warning {
-            background: #fff3cd;
-            color: #856404;
-            padding: 15px;
-            margin: 0 30px;
-            border-radius: 10px;
-            border-left: 4px solid #ffc107;
-            text-align: center;
-            font-weight: 600;
-        }
-        
         .content {
             padding: 30px;
         }
@@ -622,45 +611,40 @@ HTML_TEMPLATE = '''
         .input-group {
             display: flex;
             gap: 15px;
-            margin-bottom: 20px;
+            margin-bottom: 15px;
         }
         
         input[type="text"] {
             flex: 1;
-            padding: 15px 20px;
-            border: 2px solid #e0e0e0;
-            border-radius: 10px;
+            padding: 18px 25px;
+            border: 3px solid #e0e0e0;
+            border-radius: 12px;
             font-size: 16px;
             transition: all 0.3s;
         }
         
         input[type="text"]:focus {
             outline: none;
-            border-color: #E1306C;
-            box-shadow: 0 0 0 3px rgba(225, 48, 108, 0.1);
+            border-color: #405DE6;
+            box-shadow: 0 0 0 4px rgba(64, 93, 230, 0.1);
         }
         
         button {
-            background: linear-gradient(45deg, #E1306C, #833AB4);
+            background: linear-gradient(45deg, #405DE6, #833AB4);
             color: white;
             border: none;
-            padding: 15px 30px;
-            border-radius: 10px;
+            padding: 18px 40px;
+            border-radius: 12px;
             font-size: 16px;
-            font-weight: 600;
+            font-weight: 700;
             cursor: pointer;
             transition: all 0.3s;
-            min-width: 150px;
+            min-width: 180px;
         }
         
         button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(225, 48, 108, 0.2);
-        }
-        
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(64, 93, 230, 0.3);
         }
         
         .loader {
@@ -670,13 +654,13 @@ HTML_TEMPLATE = '''
         }
         
         .spinner {
-            width: 40px;
-            height: 40px;
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #E1306C;
+            width: 50px;
+            height: 50px;
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #405DE6;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
+            margin: 0 auto 20px;
         }
         
         @keyframes spin {
@@ -687,16 +671,144 @@ HTML_TEMPLATE = '''
         .result {
             display: none;
             background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            padding: 25px;
+            padding: 30px;
             border-radius: 15px;
-            margin-top: 20px;
-            border: 2px solid #e0e0e0;
+            margin-top: 25px;
+            border: 3px solid #e0e0e0;
             animation: fadeIn 0.5s;
         }
         
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .result h3 {
+            color: #28a745;
+            font-size: 1.8rem;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .media-info {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+        }
+        
+        .media-info p {
+            margin-bottom: 8px;
+            color: #333;
+        }
+        
+        .media-info span {
+            color: #405DE6;
+            font-weight: 700;
+            background: #eef2ff;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        
+        .media-preview {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .media-preview img,
+        .media-preview video {
+            max-width: 100%;
+            max-height: 500px;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .quality-options {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            border-left: 4px solid #405DE6;
+        }
+        
+        .quality-options h4 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .quality-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .quality-item {
+            padding: 8px 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border: 1px solid #dee2e6;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .quality-item:hover {
+            background: #e9ecef;
+            border-color: #405DE6;
+        }
+        
+        .quality-item.active {
+            background: #405DE6;
+            color: white;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 25px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 15px 25px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            text-align: center;
+            flex: 1;
+            min-width: 150px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: all 0.3s;
+        }
+        
+        .btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+        
+        .btn-download {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+        }
+        
+        .btn-copy {
+            background: linear-gradient(45deg, #6c757d, #495057);
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        
+        .btn-new {
+            background: linear-gradient(45deg, #fd7e14, #ff922b);
+            color: white;
+            border: none;
+            cursor: pointer;
         }
         
         .error {
@@ -708,177 +820,43 @@ HTML_TEMPLATE = '''
             margin-top: 20px;
             border-left: 5px solid #d33;
             font-weight: 600;
-            white-space: pre-line;
         }
         
-        .profile-info {
+        .feature-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 15px;
+            margin-top: 30px;
+        }
+        
+        .feature-card {
             background: white;
             padding: 20px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
-            text-align: center;
-        }
-        
-        .profile-info h4 {
-            color: #333;
-            font-size: 1.4rem;
-            margin-bottom: 10px;
-        }
-        
-        .stories-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 15px;
-            margin-top: 20px;
-        }
-        
-        .story-card {
-            background: white;
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            transition: transform 0.3s;
-        }
-        
-        .story-card:hover {
-            transform: translateY(-3px);
-        }
-        
-        .story-media {
-            width: 100%;
-            height: 250px;
-            overflow: hidden;
-            position: relative;
-        }
-        
-        .story-media img,
-        .story-media video {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        
-        .story-type {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: rgba(0,0,0,0.7);
-            color: white;
-            padding: 4px 8px;
-            border-radius: 15px;
-            font-size: 0.7rem;
-        }
-        
-        .story-actions {
-            padding: 12px;
-            text-align: center;
-        }
-        
-        .story-actions a {
-            display: inline-block;
-            background: linear-gradient(45deg, #28a745, #20c997);
-            color: white;
-            text-decoration: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-weight: 600;
-            font-size: 0.9rem;
-            transition: all 0.3s;
-        }
-        
-        .story-actions a:hover {
-            background: linear-gradient(45deg, #20c997, #28a745);
-            transform: translateY(-2px);
-        }
-        
-        .no-stories {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-        }
-        
-        .no-stories i {
-            font-size: 3rem;
-            color: #ccc;
-            margin-bottom: 15px;
-        }
-        
-        .actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-        
-        .btn {
-            padding: 12px 20px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-            text-align: center;
-            min-width: 140px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            transition: all 0.3s;
-            border: none;
-            cursor: pointer;
-            font-size: 0.9rem;
-        }
-        
-        .btn-download-all {
-            background: linear-gradient(45deg, #28a745, #20c997);
-            color: white;
-        }
-        
-        .btn-new {
-            background: linear-gradient(45deg, #fd7e14, #ff922b);
-            color: white;
-        }
-        
-        .examples {
-            background: #f8f9fa;
-            padding: 15px;
             border-radius: 10px;
-            margin-top: 20px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+            border-top: 4px solid #405DE6;
         }
         
-        .examples h4 {
-            color: #555;
+        .feature-card i {
+            font-size: 2rem;
+            color: #405DE6;
             margin-bottom: 10px;
+        }
+        
+        .feature-card h4 {
+            color: #333;
+            margin-bottom: 8px;
+        }
+        
+        .feature-card p {
+            color: #666;
             font-size: 0.9rem;
-        }
-        
-        .example-item {
-            display: inline-block;
-            background: white;
-            padding: 8px 12px;
-            margin: 5px;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            color: #E1306C;
-            cursor: pointer;
-            border: 1px solid #e0e0e0;
-        }
-        
-        .example-item:hover {
-            background: #f8f8f8;
         }
         
         @media (max-width: 768px) {
-            .container {
-                border-radius: 15px;
-            }
-            
-            .header {
-                padding: 20px;
-            }
-            
             .header h1 {
-                font-size: 1.8rem;
+                font-size: 2rem;
             }
             
             .input-group {
@@ -890,20 +868,16 @@ HTML_TEMPLATE = '''
                 min-width: auto;
             }
             
-            .stories-container {
-                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            }
-            
-            .story-media {
-                height: 200px;
-            }
-            
             .actions {
                 flex-direction: column;
             }
             
             .btn {
                 width: 100%;
+            }
+            
+            .feature-list {
+                grid-template-columns: 1fr;
             }
         }
     </style>
@@ -912,110 +886,161 @@ HTML_TEMPLATE = '''
 <body>
     <div class="container">
         <div class="header">
-            <h1><i class="fab fa-instagram"></i> Instagram Story Downloader</h1>
-            <p>Download Public Instagram Stories • No Login Required</p>
-            <div class="badge">PUBLIC ACCOUNTS ONLY</div>
-        </div>
-        
-        <div class="warning">
-            <i class="fas fa-exclamation-triangle"></i> 
-            This tool works only with PUBLIC Instagram accounts. Private accounts require login.
+            <h1><i class="fab fa-instagram"></i> Instagram Downloader</h1>
+            <p>Download Posts, Reels, Stories in Highest Quality • No Watermark</p>
+            <div class="badge">✓ HIGH QUALITY DOWNLOAD</div>
         </div>
         
         <div class="content">
             <div class="input-section">
-                <h2 style="color: #333; margin-bottom: 15px; font-size: 1.4rem;">Enter Instagram Details</h2>
+                <h2 style="color: #333; margin-bottom: 20px; font-size: 1.6rem;">Download Instagram Media</h2>
                 
                 <div class="input-group">
-                    <input type="text" id="urlInput" placeholder="Enter username (e.g., instagram) or profile URL...">
-                    <button onclick="downloadStories()" id="downloadBtn">
-                        <i class="fas fa-download"></i> Get Stories
+                    <input type="text" id="urlInput" placeholder="Paste Instagram Post/Reel/Story URL here...">
+                    <button onclick="downloadMedia()">
+                        <i class="fas fa-download"></i> Download
                     </button>
                 </div>
                 
-                <div class="examples">
-                    <h4>Try these public accounts:</h4>
-                    <div class="example-item" onclick="useExample('instagram')">instagram</div>
-                    <div class="example-item" onclick="useExample('natgeo')">natgeo</div>
-                    <div class="example-item" onclick="useExample('nasa')">nasa</div>
-                    <div class="example-item" onclick="useExample('netflix')">netflix</div>
-                    <div class="example-item" onclick="useExample('instagram')">@instagram</div>
+                <div class="feature-list">
+                    <div class="feature-card">
+                        <i class="fas fa-images"></i>
+                        <h4>HD Photos</h4>
+                        <p>Download images in original high resolution</p>
+                    </div>
+                    
+                    <div class="feature-card">
+                        <i class="fas fa-video"></i>
+                        <h4>Full HD Videos</h4>
+                        <p>Get videos in highest available quality</p>
+                    </div>
+                    
+                    <div class="feature-card">
+                        <i class="fas fa-layer-group"></i>
+                        <h4>Carousel Posts</h4>
+                        <p>Download multiple images/videos from posts</p>
+                    </div>
+                    
+                    <div class="feature-card">
+                        <i class="fas fa-expand-arrows-alt"></i>
+                        <h4>Full Size</h4>
+                        <p>Get media in original dimensions</p>
+                    </div>
                 </div>
             </div>
             
             <div class="loader" id="loader">
                 <div class="spinner"></div>
-                <p style="font-size: 1rem; color: #666; margin-top: 10px;">Fetching stories...</p>
-                <p id="statusText" style="margin-top: 5px; color: #888; font-size: 0.85rem;"></p>
+                <p style="font-size: 1.1rem; color: #666;">Extracting highest quality media...</p>
+                <p id="statusText" style="margin-top: 10px; color: #888; font-size: 0.9rem;"></p>
             </div>
             
             <div class="error" id="error"></div>
             
             <div class="result" id="result">
-                <!-- Results will be inserted here -->
+                <h3><i class="fas fa-check-circle"></i> Media Found!</h3>
+                
+                <div class="media-info">
+                    <p>
+                        <strong>Type:</strong> 
+                        <span id="mediaType" style="text-transform: uppercase;"></span>
+                    </p>
+                    <p>
+                        <strong>Quality:</strong> 
+                        <span id="qualityType">HIGHEST</span>
+                    </p>
+                    <p>
+                        <strong>Method:</strong> 
+                        <span id="methodName"></span>
+                    </p>
+                    <p id="dimensionsInfo" style="display: none;">
+                        <strong>Dimensions:</strong> 
+                        <span id="dimensions"></span>
+                    </p>
+                    <p id="captionInfo" style="display: none;">
+                        <strong>Caption:</strong> 
+                        <span id="caption"></span>
+                    </p>
+                </div>
+                
+                <div class="media-preview" id="mediaPreview">
+                    <!-- Media will be inserted here -->
+                </div>
+                
+                <div class="quality-options" id="qualityOptions" style="display: none;">
+                    <h4><i class="fas fa-sliders-h"></i> Available Qualities</h4>
+                    <div class="quality-list" id="qualityList">
+                        <!-- Quality options will be inserted here -->
+                    </div>
+                </div>
+                
+                <div class="actions">
+                    <a href="#" id="downloadLink" class="btn btn-download" target="_blank">
+                        <i class="fas fa-download"></i> Download Now
+                    </a>
+                    <button onclick="copyUrl()" class="btn btn-copy">
+                        <i class="fas fa-copy"></i> Copy URL
+                    </button>
+                    <button onclick="resetForm()" class="btn btn-new">
+                        <i class="fas fa-redo"></i> Try Another
+                    </button>
+                </div>
             </div>
         </div>
     </div>
     
     <script>
-        let currentStoriesData = null;
-        let isProcessing = false;
+        let currentMediaData = null;
+        let currentQualityIndex = 0;
         
-        function useExample(username) {
-            document.getElementById('urlInput').value = username;
-            downloadStories();
-        }
-        
-        async function downloadStories() {
-            if (isProcessing) return;
-            
-            const input = document.getElementById('urlInput').value.trim();
+        async function downloadMedia() {
+            const url = document.getElementById('urlInput').value.trim();
             const errorDiv = document.getElementById('error');
             const loader = document.getElementById('loader');
-            const resultDiv = document.getElementById('result');
-            const downloadBtn = document.getElementById('downloadBtn');
+            const result = document.getElementById('result');
             
             // Reset
             errorDiv.style.display = 'none';
-            resultDiv.style.display = 'none';
-            currentStoriesData = null;
-            isProcessing = true;
-            downloadBtn.disabled = true;
-            downloadBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+            result.style.display = 'none';
+            currentMediaData = null;
             
-            // Validate input
-            if (!input) {
-                showError('Please enter Instagram username or URL');
-                resetButton();
+            // Validate URL
+            if (!url) {
+                showError('Please enter an Instagram URL');
+                return;
+            }
+            
+            if (!url.includes('instagram.com')) {
+                showError('Please enter a valid Instagram URL');
                 return;
             }
             
             // Show loader
             loader.style.display = 'block';
             
-            // Status messages
+            // Update status messages
             const statusMessages = [
-                'Checking account...',
-                'Fetching profile data...',
-                'Looking for stories...',
-                'Extracting media...',
-                'Almost done...'
+                'Fetching Instagram page...',
+                'Analyzing media content...',
+                'Extracting highest quality...',
+                'Preparing download...',
+                'Almost ready...'
             ];
             
             let messageIndex = 0;
             const statusInterval = setInterval(() => {
                 document.getElementById('statusText').textContent = statusMessages[messageIndex];
                 messageIndex = (messageIndex + 1) % statusMessages.length;
-            }, 1000);
+            }, 1200);
             
             try {
                 // Make API request
-                const response = await fetch('/api/stories', {
+                const response = await fetch('/api/download', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ url: input })
+                    body: JSON.stringify({ url: url })
                 });
                 
                 clearInterval(statusInterval);
@@ -1026,85 +1051,146 @@ HTML_TEMPLATE = '''
                 loader.style.display = 'none';
                 
                 if (data.success) {
-                    currentStoriesData = data;
-                    displayResults(data);
+                    // Store media data
+                    currentMediaData = data;
+                    
+                    // Update UI
+                    document.getElementById('mediaType').textContent = data.media_type;
+                    document.getElementById('methodName').textContent = data.method;
+                    document.getElementById('downloadLink').href = data.media_url;
+                    
+                    // Show dimensions if available
+                    if (data.dimensions) {
+                        document.getElementById('dimensions').textContent = 
+                            `${data.dimensions.width} × ${data.dimensions.height}`;
+                        document.getElementById('dimensionsInfo').style.display = 'block';
+                    }
+                    
+                    // Show caption if available
+                    if (data.caption) {
+                        const caption = data.caption.length > 100 ? 
+                            data.caption.substring(0, 100) + '...' : data.caption;
+                        document.getElementById('caption').textContent = caption;
+                        document.getElementById('captionInfo').style.display = 'block';
+                    }
+                    
+                    // Update media preview
+                    const mediaPreview = document.getElementById('mediaPreview');
+                    
+                    if (data.media_type === 'video') {
+                        mediaPreview.innerHTML = `
+                            <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
+                                <video controls style="width: 100%; max-width: 500px; border-radius: 8px;">
+                                    <source src="${data.media_url}" type="video/mp4">
+                                    Your browser does not support video playback.
+                                </video>
+                            </div>
+                            <p style="color: #666; font-size: 0.9rem;">
+                                <i class="fas fa-info-circle"></i> Click play to preview the video
+                            </p>
+                        `;
+                    } else {
+                        mediaPreview.innerHTML = `
+                            <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
+                                <img src="${data.media_url}" 
+                                     style="max-width: 100%; max-height: 500px; border-radius: 8px;"
+                                     alt="Instagram Image Preview"
+                                     onerror="this.onerror=null; this.src='https://via.placeholder.com/500x500?text=Image+Loading+Error'">
+                            </div>
+                            <p style="color: #666; font-size: 0.9rem;">
+                                <i class="fas fa-info-circle"></i> High quality image preview
+                            </p>
+                        `;
+                    }
+                    
+                    // Show quality options if multiple URLs available
+                    if (data.all_urls && data.all_urls.length > 1) {
+                        showQualityOptions(data.all_urls);
+                    }
+                    
+                    // Show result
+                    result.style.display = 'block';
+                    
+                    // Auto-scroll to result
+                    result.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    
                 } else {
-                    showError(data.error || 'Failed to fetch stories. Make sure the account is public.');
+                    showError(data.error || 'Failed to extract media. The post might be private or restricted.');
                 }
                 
             } catch (error) {
                 clearInterval(statusInterval);
                 loader.style.display = 'none';
                 showError('Network error: ' + error.message);
-            } finally {
-                resetButton();
             }
         }
         
-        function displayResults(data) {
-            const resultDiv = document.getElementById('result');
+        function showQualityOptions(urls) {
+            const qualityOptions = document.getElementById('qualityOptions');
+            const qualityList = document.getElementById('qualityList');
             
-            let storiesHTML = '';
+            qualityList.innerHTML = '';
             
-            if (data.stories && data.stories.length > 0) {
-                storiesHTML = `
-                    <div class="profile-info">
-                        <h4><i class="fab fa-instagram"></i> @${data.username}</h4>
-                        <p><strong>Stories Found:</strong> ${data.count} | <strong>Method:</strong> ${data.method}</p>
+            urls.forEach((urlInfo, index) => {
+                const qualityDiv = document.createElement('div');
+                qualityDiv.className = `quality-item ${index === 0 ? 'active' : ''}`;
+                qualityDiv.innerHTML = `
+                    <div style="font-weight: 600;">${urlInfo.quality}</div>
+                    <div style="font-size: 0.8rem; color: #666;">${urlInfo.type}</div>
+                `;
+                
+                qualityDiv.onclick = () => selectQuality(urlInfo, index);
+                qualityList.appendChild(qualityDiv);
+            });
+            
+            qualityOptions.style.display = 'block';
+        }
+        
+        function selectQuality(urlInfo, index) {
+            if (!currentMediaData) return;
+            
+            // Update active class
+            document.querySelectorAll('.quality-item').forEach((item, i) => {
+                item.classList.toggle('active', i === index);
+            });
+            
+            // Update current URL
+            currentQualityIndex = index;
+            
+            // Update download link
+            document.getElementById('downloadLink').href = urlInfo.url;
+            
+            // Update preview
+            const mediaPreview = document.getElementById('mediaPreview');
+            
+            if (urlInfo.type === 'video') {
+                mediaPreview.innerHTML = `
+                    <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
+                        <video controls style="width: 100%; max-width: 500px; border-radius: 8px;">
+                            <source src="${urlInfo.url}" type="video/mp4">
+                            Your browser does not support video playback.
+                        </video>
                     </div>
-                    
-                    <div class="stories-container" id="storiesGrid">
-                        ${data.stories.map((story, index) => `
-                            <div class="story-card">
-                                <div class="story-media">
-                                    ${story.type === 'video' 
-                                        ? `<video controls style="width: 100%; height: 100%; object-fit: cover;">
-                                            <source src="${story.url}" type="video/mp4">
-                                          </video>`
-                                        : `<img src="${story.url}" alt="Story ${index + 1}" 
-                                             onerror="this.src='https://via.placeholder.com/300x300?text=Image+Not+Available'" 
-                                             style="width: 100%; height: 100%; object-fit: cover;">`
-                                    }
-                                    <div class="story-type">
-                                        ${story.type === 'video' ? '<i class="fas fa-video"></i> Video' : '<i class="fas fa-image"></i> Image'}
-                                    </div>
-                                </div>
-                                <div class="story-actions">
-                                    <a href="${story.url}" 
-                                       download="instagram_story_${data.username}_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}" 
-                                       target="_blank">
-                                        <i class="fas fa-download"></i> Download ${story.type}
-                                    </a>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                    
-                    <div class="actions">
-                        <button onclick="downloadAllStories()" class="btn btn-download-all">
-                            <i class="fas fa-download"></i> Download All (${data.count})
-                        </button>
-                        <button onclick="resetForm()" class="btn btn-new">
-                            <i class="fas fa-redo"></i> Try Another
-                        </button>
-                    </div>
+                    <p style="color: #666; font-size: 0.9rem;">
+                        <i class="fas fa-info-circle"></i> ${urlInfo.quality} quality
+                    </p>
                 `;
             } else {
-                storiesHTML = `
-                    <div class="no-stories">
-                        <i class="fas fa-images"></i>
-                        <h3>No Stories Found</h3>
-                        <p>@${data.username} doesn't have any active stories right now.</p>
-                        <button onclick="resetForm()" class="btn btn-new" style="margin-top: 20px;">
-                            <i class="fas fa-search"></i> Try Another Account
-                        </button>
+                mediaPreview.innerHTML = `
+                    <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
+                        <img src="${urlInfo.url}" 
+                             style="max-width: 100%; max-height: 500px; border-radius: 8px;"
+                             alt="Instagram Image Preview"
+                             onerror="this.onerror=null; this.src='https://via.placeholder.com/500x500?text=Image+Loading+Error'">
                     </div>
+                    <p style="color: #666; font-size: 0.9rem;">
+                        <i class="fas fa-info-circle"></i> ${urlInfo.quality} quality
+                    </p>
                 `;
             }
             
-            resultDiv.innerHTML = storiesHTML;
-            resultDiv.style.display = 'block';
-            resultDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            // Update quality type display
+            document.getElementById('qualityType').textContent = urlInfo.quality.toUpperCase();
         }
         
         function showError(message) {
@@ -1113,29 +1199,27 @@ HTML_TEMPLATE = '''
                 <i class="fas fa-exclamation-triangle"></i> ${message}
             `;
             errorDiv.style.display = 'block';
-            errorDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
             
+            // Auto-hide error after 8 seconds
             setTimeout(() => {
                 errorDiv.style.display = 'none';
-            }, 10000);
+            }, 8000);
         }
         
-        function downloadAllStories() {
-            if (!currentStoriesData || !currentStoriesData.stories) return;
-            
-            currentStoriesData.stories.forEach((story, index) => {
-                setTimeout(() => {
-                    const link = document.createElement('a');
-                    link.href = story.url;
-                    link.download = `instagram_${currentStoriesData.username}_story_${index + 1}.${story.type === 'video' ? 'mp4' : 'jpg'}`;
-                    link.target = '_blank';
-                    document.body.appendChild(link);
-                    link.click();
-                    document.body.removeChild(link);
-                }, index * 500); // Stagger downloads
-            });
-            
-            alert(`Downloading ${currentStoriesData.stories.length} stories... Check your downloads folder.`);
+        function copyUrl() {
+            if (currentMediaData && currentMediaData.media_url) {
+                const urlToCopy = currentMediaData.all_urls && currentMediaData.all_urls[currentQualityIndex] ?
+                    currentMediaData.all_urls[currentQualityIndex].url : currentMediaData.media_url;
+                
+                navigator.clipboard.writeText(urlToCopy)
+                    .then(() => {
+                        alert('✓ Media URL copied to clipboard!');
+                    })
+                    .catch(err => {
+                        console.error('Copy failed:', err);
+                        alert('Failed to copy URL. Please try again.');
+                    });
+            }
         }
         
         function resetForm() {
@@ -1143,30 +1227,24 @@ HTML_TEMPLATE = '''
             document.getElementById('result').style.display = 'none';
             document.getElementById('error').style.display = 'none';
             document.getElementById('urlInput').focus();
-            currentStoriesData = null;
-        }
-        
-        function resetButton() {
-            const downloadBtn = document.getElementById('downloadBtn');
-            downloadBtn.disabled = false;
-            downloadBtn.innerHTML = '<i class="fas fa-download"></i> Get Stories';
-            isProcessing = false;
+            currentMediaData = null;
+            currentQualityIndex = 0;
         }
         
         // Enter key support
         document.getElementById('urlInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' && !isProcessing) {
-                downloadStories();
+            if (e.key === 'Enter') {
+                downloadMedia();
             }
         });
         
         // Auto-focus on input
         document.getElementById('urlInput').focus();
         
-        // Add sample for testing
+        // Add sample URL for testing
         setTimeout(() => {
-            document.getElementById('urlInput').value = 'instagram';
-        }, 500);
+            document.getElementById('urlInput').value = 'https://www.instagram.com/p/C1AZAMgLwT9/';
+        }, 1000);
     </script>
 </body>
 </html>
@@ -1176,11 +1254,11 @@ HTML_TEMPLATE = '''
 def home():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/stories', methods=['GET', 'POST'])
-def api_stories():
-    """API endpoint for downloading Instagram stories"""
+@app.route('/api/download', methods=['GET', 'POST'])
+def api_download():
+    """API endpoint for downloading Instagram media"""
     try:
-        # Get URL/username from request
+        # Get URL from request
         if request.method == 'GET':
             url = request.args.get('url')
         else:
@@ -1190,19 +1268,32 @@ def api_stories():
         if not url:
             return jsonify({
                 'success': False,
-                'error': 'URL or username is required'
+                'error': 'URL parameter is required'
             }), 400
         
-        # Download stories
-        result = story_downloader.download_stories(url)
+        # Validate Instagram URL
+        if 'instagram.com' not in url:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid Instagram URL'
+            }), 400
+        
+        # Download media using our downloader
+        result = downloader.download_media(url)
+        
+        # Fix URL formatting before returning
+        if result.get('success') and 'media_url' in result:
+            result['media_url'] = downloader.fix_url_formatting(result['media_url'])
+            
+            # Fix all URLs
+            if 'all_urls' in result:
+                for url_info in result['all_urls']:
+                    if 'url' in url_info:
+                        url_info['url'] = downloader.fix_url_formatting(url_info['url'])
         
         return jsonify(result)
     
     except Exception as e:
-        import traceback
-        print(f"Server error: {e}")
-        print(traceback.format_exc())
-        
         return jsonify({
             'success': False,
             'error': f'Server error: {str(e)}'
@@ -1213,12 +1304,13 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'service': 'Instagram Story Downloader',
+        'service': 'Instagram High Quality Downloader',
         'version': '2.0.0',
-        'feature': 'Public Accounts Only',
-        'note': 'For private accounts, login is required'
+        'features': ['HD Images', 'Full HD Videos', 'Carousel Posts', 'High Quality'],
+        'working': 'YES'
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
+[file content end]

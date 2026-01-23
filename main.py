@@ -4,8 +4,9 @@ import json
 import requests
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 import time
+import mimetypes
 
 app = Flask(__name__)
 CORS(app)
@@ -19,7 +20,7 @@ class InstagramSelfDownloader:
         """Set up realistic browser headers"""
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/heic,image/heif,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'DNT': '1',
@@ -42,433 +43,322 @@ class InstagramSelfDownloader:
             print(f"Error fetching page: {str(e)}")
             return None
     
-    def extract_shortcode(self, url):
-        """Extract shortcode from Instagram URL"""
+    def detect_media_type_from_url(self, url):
+        """Detect media type from URL"""
+        if not url:
+            return 'unknown'
+        
+        url_lower = url.lower()
+        
+        # Video formats
+        video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv']
+        for ext in video_extensions:
+            if ext in url_lower:
+                return 'video'
+        
+        # Image formats (including HEIC/HEIF)
+        image_extensions = [
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', 
+            '.heic', '.heif', '.tiff', '.svg'
+        ]
+        for ext in image_extensions:
+            if ext in url_lower:
+                return 'image'
+        
+        # Check URL patterns
+        if '/reel/' in url or '/tv/' in url:
+            return 'video'
+        elif 'video' in url_lower:
+            return 'video'
+        elif 'image' in url_lower or 'jpg' in url_lower or 'png' in url_lower:
+            return 'image'
+        
+        # Check query parameters
+        parsed_url = urlparse(url)
+        if 'heic' in parsed_url.path.lower():
+            return 'image'
+        
+        return 'unknown'
+    
+    def convert_heic_to_jpg_url(self, url):
+        """Convert HEIC URL to JPG URL if possible"""
+        if not url:
+            return url
+        
+        # If it's already a HEIC URL, try to convert to JPG
+        if '.heic' in url.lower():
+            # Try different conversions
+            jpg_url = url.replace('.heic', '.jpg').replace('.HEIC', '.jpg')
+            
+            # Also try to remove format parameters
+            parsed_url = urlparse(url)
+            path = parsed_url.path
+            
+            # Check if path ends with .heic
+            if path.lower().endswith('.heic'):
+                # Try with .jpg extension
+                base_path = path[:-5]  # Remove .heic
+                new_path = base_path + '.jpg'
+                
+                # Reconstruct URL
+                jpg_url = parsed_url._replace(path=new_path).geturl()
+                
+                # Try both variations
+                return jpg_url
+        
+        return url
+    
+    def get_best_image_url(self, url):
+        """Get the best quality image URL"""
+        if not url:
+            return url
+        
+        # Try to get higher quality versions
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query)
+        
+        # Remove size limitations
+        for param in ['stp', 'width', 'height', 'size', 'w', 'h']:
+            if param in query_params:
+                del query_params[param]
+        
+        # Reconstruct URL without size limits
+        new_query = '&'.join([f"{k}={v[0]}" for k, v in query_params.items()])
+        best_url = parsed_url._replace(query=new_query).geturl()
+        
+        # Try to remove quality parameters that might limit resolution
+        patterns_to_remove = [
+            r'&w=\d+',
+            r'&h=\d+',
+            r'&size=\d+',
+            r'&stp=[^&]*',
+            r'c\d+\.\d+\.\d+\.\d+',  # Crop patterns like c288.0.864.864
+        ]
+        
+        for pattern in patterns_to_remove:
+            best_url = re.sub(pattern, '', best_url)
+        
+        # For HEIC, try to get JPG version
+        if '.heic' in best_url.lower():
+            jpg_url = self.convert_heic_to_jpg_url(best_url)
+            return jpg_url
+        
+        return best_url
+    
+    def extract_media_urls_from_html(self, html_content):
+        """Extract all media URLs from HTML"""
+        urls = []
+        
+        # Look for all possible media URLs
         patterns = [
-            r'instagram\.com/reel/([^/?]+)',
-            r'instagram\.com/p/([^/?]+)',
-            r'instagram\.com/stories/([^/?]+)',
-            r'instagram\.com/tv/([^/?]+)',
-            r'reel/([^/?]+)',
-            r'p/([^/?]+)',
-            r'stories/([^/?]+)',
-            r'tv/([^/?]+)'
+            r'"display_url":"([^"]+)"',
+            r'"displayUrl":"([^"]+)"',
+            r'"video_url":"([^"]+)"',
+            r'"videoUrl":"([^"]+)"',
+            r'"thumbnail_src":"([^"]+)"',
+            r'"thumbnailSrc":"([^"]+)"',
+            r'"src":"([^"]+)"',
+            r'content="([^"]+\.(?:mp4|jpg|jpeg|png|gif|webp|heic|heif))"',
+            r'src="([^"]+\.(?:mp4|jpg|jpeg|png|gif|webp|heic|heif))"',
+            r'url="([^"]+\.(?:mp4|jpg|jpeg|png|gif|webp|heic|heif))"',
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return None
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            for match in matches:
+                if match and ('instagram.com' in match or 'cdninstagram.com' in match or 'fbcdn.net' in match):
+                    # Clean URL
+                    clean_url = match.replace('\\/', '/').replace('\\u0026', '&')
+                    
+                    # Detect media type
+                    media_type = self.detect_media_type_from_url(clean_url)
+                    
+                    # Get quality indicator
+                    quality = self.get_quality_indicator(clean_url)
+                    
+                    urls.append({
+                        'url': clean_url,
+                        'type': media_type,
+                        'quality': quality,
+                        'original_url': clean_url
+                    })
+        
+        # Remove duplicates
+        unique_urls = []
+        seen_urls = set()
+        for url_info in urls:
+            if url_info['url'] not in seen_urls:
+                seen_urls.add(url_info['url'])
+                unique_urls.append(url_info)
+        
+        return unique_urls
     
-    def find_highest_quality_video(self, video_data):
-        """Find highest quality video from available video URLs"""
-        if not video_data:
-            return None
+    def get_quality_indicator(self, url):
+        """Get quality indicator from URL"""
+        if not url:
+            return 'unknown'
         
-        # If video_data is a string (single URL)
-        if isinstance(video_data, str):
-            return video_data
+        url_lower = url.lower()
         
-        # If video_data is a list
-        if isinstance(video_data, list):
-            # Sort by quality indicators
-            quality_order = ['1080', '720', '480', '360', '240']
-            for quality in quality_order:
-                for video in video_data:
-                    if isinstance(video, str) and quality in video:
-                        return video
-            
-            # Return first video if no quality found
-            for video in video_data:
-                if isinstance(video, str):
-                    return video
+        # Check for size indicators
+        if '1080' in url_lower:
+            return '1080p'
+        elif '720' in url_lower:
+            return '720p'
+        elif '480' in url_lower:
+            return '480p'
+        elif '360' in url_lower:
+            return '360p'
+        elif 'hd' in url_lower:
+            return 'hd'
+        elif 'high' in url_lower:
+            return 'high'
+        elif 'low' in url_lower:
+            return 'low'
         
-        # If video_data is a dict with quality options
-        if isinstance(video_data, dict):
-            # Check for specific quality keys
-            quality_keys = ['hd', 'high', '1080', '720', 'sd', 'low']
-            for key in quality_keys:
-                if key in video_data:
-                    return video_data[key]
-            
-            # Return first value
-            for key, value in video_data.items():
-                if value:
-                    return value
+        # Check for image size patterns
+        size_match = re.search(r'(\d{3,4})x(\d{3,4})', url_lower)
+        if size_match:
+            width = int(size_match.group(1))
+            height = int(size_match.group(2))
+            if width >= 1920 or height >= 1080:
+                return 'full_hd'
+            elif width >= 1280 or height >= 720:
+                return 'hd'
+            else:
+                return f"{width}x{height}"
         
-        return None
+        return 'standard'
     
-    def find_highest_quality_image(self, image_data):
-        """Find highest quality image from available image URLs"""
-        if not image_data:
+    def sort_urls_by_quality(self, urls):
+        """Sort URLs by quality (highest first)"""
+        quality_order = {
+            'full_hd': 10,
+            '1080p': 9,
+            'hd': 8,
+            '720p': 7,
+            'high': 6,
+            'standard': 5,
+            '480p': 4,
+            '360p': 3,
+            'low': 2,
+            'unknown': 1
+        }
+        
+        def quality_score(url_info):
+            quality = url_info.get('quality', 'unknown').lower()
+            # Get base score
+            score = quality_order.get(quality, 0)
+            
+            # Bonus for larger images
+            if url_info['type'] == 'image':
+                size_match = re.search(r'(\d{3,4})x(\d{3,4})', url_info['url'].lower())
+                if size_match:
+                    width = int(size_match.group(1))
+                    height = int(size_match.group(2))
+                    score += (width * height) / 1000000  # Add based on megapixels
+            
+            return score
+        
+        return sorted(urls, key=quality_score, reverse=True)
+    
+    def get_direct_media_from_url(self, url):
+        """Get direct media URL from Instagram CDN link"""
+        try:
+            # If it's already a direct CDN link
+            if 'cdninstagram.com' in url or 'fbcdn.net' in url:
+                # Clean up the URL
+                parsed_url = urlparse(url)
+                
+                # Remove tracking parameters
+                clean_params = {}
+                for key, value in parse_qs(parsed_url.query).items():
+                    if key not in ['_nc_cat', '_nc_sid', '_nc_ohc', '_nc_oc', 
+                                  '_nc_zt', '_nc_ht', '_nc_gid', 'oh', 'oe']:
+                        clean_params[key] = value[0]
+                
+                # Reconstruct URL
+                new_query = '&'.join([f"{k}={v}" for k, v in clean_params.items()])
+                clean_url = parsed_url._replace(query=new_query).geturl()
+                
+                # Detect media type
+                media_type = self.detect_media_type_from_url(clean_url)
+                
+                # For HEIC images, try to get JPG version
+                if media_type == 'image' and '.heic' in clean_url.lower():
+                    jpg_url = self.convert_heic_to_jpg_url(clean_url)
+                    if jpg_url != clean_url:
+                        return {
+                            'url': jpg_url,
+                            'type': 'image',
+                            'quality': 'converted_jpg',
+                            'original_heic': clean_url
+                        }
+                
+                return {
+                    'url': clean_url,
+                    'type': media_type,
+                    'quality': self.get_quality_indicator(clean_url),
+                    'is_direct': True
+                }
+            
             return None
-        
-        # If image_data is a string (single URL)
-        if isinstance(image_data, str):
-            return image_data
-        
-        # If image_data is a list
-        if isinstance(image_data, list):
-            # Sort by size indicators
-            size_order = ['1080', '2048', '1536', '1280', '1024', '800', '640', '480', '320']
-            for size in size_order:
-                for img in image_data:
-                    if isinstance(img, str) and size in img:
-                        return img
             
-            # Return largest image by looking at dimensions in URL
-            max_size = 0
-            best_image = None
-            for img in image_data:
-                if isinstance(img, str):
-                    # Try to extract dimensions from URL
-                    size_match = re.search(r'(\d{3,4})x(\d{3,4})', img)
-                    if size_match:
-                        size = int(size_match.group(1)) * int(size_match.group(2))
-                        if size > max_size:
-                            max_size = size
-                            best_image = img
-            
-            if best_image:
-                return best_image
-            
-            # Return first image
-            for img in image_data:
-                if isinstance(img, str):
-                    return img
-        
-        # If image_data is a dict
-        if isinstance(image_data, dict):
-            # Check for specific size keys
-            size_keys = ['hd', 'high', '1080', '720', 'large', 'medium', 'small']
-            for key in size_keys:
-                if key in image_data:
-                    return image_data[key]
-            
-            # Return first value
-            for key, value in image_data.items():
-                if value:
-                    return value
-        
-        return None
+        except Exception as e:
+            print(f"Error processing direct URL: {str(e)}")
+            return None
     
     def extract_from_shared_data(self, html_content):
-        """Extract media data from Instagram's shared data"""
+        """Extract media from shared data"""
         try:
-            # Look for the shared data script
             pattern = r'<script[^>]*>window\._sharedData\s*=\s*({.*?});</script>'
             match = re.search(pattern, html_content, re.DOTALL)
             
             if match:
                 shared_data = json.loads(match.group(1))
                 
-                # Navigate through the data structure
-                post_data = None
+                # Navigate to get media URLs
+                entry_data = shared_data.get('entry_data', {})
                 
-                # Check entry data
-                if 'entry_data' in shared_data:
-                    for key, data in shared_data['entry_data'].items():
-                        if isinstance(data, list) and len(data) > 0:
-                            post_data = data[0]
-                            break
+                for page_type, pages in entry_data.items():
+                    if isinstance(pages, list) and pages:
+                        for page in pages:
+                            if 'graphql' in page:
+                                media_data = page['graphql'].get('shortcode_media', {})
+                                
+                                # Get display URL
+                                display_url = media_data.get('display_url')
+                                if display_url:
+                                    return [{
+                                        'url': display_url,
+                                        'type': 'image',
+                                        'quality': 'display',
+                                        'from_graphql': True
+                                    }]
+                                
+                                # Get video URL
+                                video_url = media_data.get('video_url')
+                                if video_url:
+                                    return [{
+                                        'url': video_url,
+                                        'type': 'video',
+                                        'quality': 'video',
+                                        'from_graphql': True
+                                    }]
                 
-                if not post_data:
-                    return None
-                
-                # Extract from GraphQL
-                if 'graphql' in post_data:
-                    media_data = post_data['graphql'].get('shortcode_media', {})
-                    return self.extract_from_graphql(media_data)
-                
-                # Extract from PostPage
-                elif 'PostPage' in post_data:
-                    for page in post_data['PostPage']:
-                        if 'graphql' in page:
-                            media_data = page['graphql'].get('shortcode_media', {})
-                            return self.extract_from_graphql(media_data)
-            
             return None
             
         except Exception as e:
             print(f"Error extracting shared data: {str(e)}")
             return None
     
-    def extract_from_graphql(self, media_data):
-        """Extract media from GraphQL data structure"""
-        try:
-            result = {
-                'type': None,
-                'urls': [],
-                'is_video': False,
-                'is_carousel': False,
-                'caption': None,
-                'dimensions': None,
-                'display_url': None
-            }
-            
-            if not media_data:
-                return None
-            
-            # Get media type
-            result['type'] = media_data.get('__typename')
-            result['is_video'] = media_data.get('is_video', False)
-            result['caption'] = media_data.get('edge_media_to_caption', {}).get('edges', [{}])[0].get('node', {}).get('text', '')
-            result['dimensions'] = media_data.get('dimensions', {})
-            
-            # Handle single image/video
-            if result['type'] == 'GraphImage':
-                # Get display URL
-                display_url = media_data.get('display_url')
-                if display_url:
-                    result['display_url'] = display_url
-                    result['urls'].append({
-                        'url': display_url,
-                        'type': 'image',
-                        'quality': 'display'
-                    })
-                
-                # Get high quality images
-                if 'display_resources' in media_data:
-                    for resource in media_data['display_resources']:
-                        if 'src' in resource:
-                            result['urls'].append({
-                                'url': resource['src'],
-                                'type': 'image',
-                                'quality': f"{resource.get('config_width', 0)}x{resource.get('config_height', 0)}"
-                            })
-                
-                # Get original image
-                if 'thumbnail_resources' in media_data:
-                    for resource in media_data['thumbnail_resources']:
-                        if 'src' in resource and 'original' in resource['src']:
-                            result['urls'].append({
-                                'url': resource['src'],
-                                'type': 'image',
-                                'quality': 'original'
-                            })
-            
-            # Handle video
-            elif result['type'] == 'GraphVideo':
-                result['is_video'] = True
-                
-                # Get video URL
-                video_url = media_data.get('video_url')
-                if video_url:
-                    result['display_url'] = video_url
-                    result['urls'].append({
-                        'url': video_url,
-                        'type': 'video',
-                        'quality': 'video_url'
-                    })
-                
-                # Get display URL for thumbnail
-                display_url = media_data.get('display_url')
-                if display_url:
-                    result['urls'].append({
-                        'url': display_url,
-                        'type': 'image',
-                        'quality': 'thumbnail'
-                    })
-            
-            # Handle carousel (multiple images/videos)
-            elif result['type'] == 'GraphSidecar':
-                result['is_carousel'] = True
-                
-                edges = media_data.get('edge_sidecar_to_children', {}).get('edges', [])
-                for edge in edges:
-                    node = edge.get('node', {})
-                    node_type = node.get('__typename')
-                    
-                    if node_type == 'GraphImage':
-                        # Get display URL
-                        display_url = node.get('display_url')
-                        if display_url:
-                            result['urls'].append({
-                                'url': display_url,
-                                'type': 'image',
-                                'quality': 'display'
-                            })
-                        
-                        # Get high quality images
-                        if 'display_resources' in node:
-                            for resource in node['display_resources']:
-                                if 'src' in resource:
-                                    result['urls'].append({
-                                        'url': resource['src'],
-                                        'type': 'image',
-                                        'quality': f"{resource.get('config_width', 0)}x{resource.get('config_height', 0)}"
-                                    })
-                    
-                    elif node_type == 'GraphVideo':
-                        # Get video URL
-                        video_url = node.get('video_url')
-                        if video_url:
-                            result['urls'].append({
-                                'url': video_url,
-                                'type': 'video',
-                                'quality': 'video_url'
-                            })
-            
-            return result if result['urls'] else None
-            
-        except Exception as e:
-            print(f"Error extracting from GraphQL: {str(e)}")
-            return None
-    
-    def extract_from_alternative_sources(self, html_content):
-        """Extract media from alternative sources in HTML"""
-        try:
-            # Look for JavaScript data
-            patterns = [
-                r'"display_url":"([^"]+)"',
-                r'"displayUrl":"([^"]+)"',
-                r'"video_url":"([^"]+)"',
-                r'"videoUrl":"([^"]+)"',
-                r'"thumbnail_src":"([^"]+)"',
-                r'"thumbnailSrc":"([^"]+)"',
-                r'"src":"([^"]+\.(?:jpg|jpeg|png|mp4)[^"]*)"',
-            ]
-            
-            for pattern in patterns:
-                matches = re.findall(pattern, html_content)
-                for match in matches:
-                    if match and ('instagram.com' in match or 'cdninstagram.com' in match):
-                        return match
-            
-            return None
-            
-        except Exception as e:
-            print(f"Error extracting from alternative sources: {str(e)}")
-            return None
-    
-    def extract_high_quality_media(self, html_content):
-        """Extract high quality media using multiple methods"""
-        # Method 1: Extract from shared data (best quality)
-        print("Trying Method 1: Shared Data...")
-        graphql_data = self.extract_from_shared_data(html_content)
+    def process_media_url(self, url_info):
+        """Process and enhance media URL"""
+        processed = url_info.copy()
         
-        if graphql_data and graphql_data['urls']:
-            print(f"Found media via GraphQL: {len(graphql_data['urls'])} items")
-            return graphql_data
-        
-        # Method 2: Extract from meta tags
-        print("Trying Method 2: Meta Tags...")
-        
-        # Look for Open Graph meta tags (usually good quality)
-        meta_patterns = {
-            'og:image': r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"',
-            'og:video': r'<meta[^>]*property="og:video"[^>]*content="([^"]+)"',
-            'og:video:secure_url': r'<meta[^>]*property="og:video:secure_url"[^>]*content="([^"]+)"',
-            'twitter:image': r'<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"',
-            'twitter:player:stream': r'<meta[^>]*name="twitter:player:stream"[^>]*content="([^"]+)"',
-        }
-        
-        media_urls = []
-        is_video = False
-        
-        for meta_type, pattern in meta_patterns.items():
-            matches = re.findall(pattern, html_content)
-            for match in matches:
-                if match:
-                    media_type = 'video' if 'video' in meta_type else 'image'
-                    if 'video' in meta_type:
-                        is_video = True
-                    
-                    media_urls.append({
-                        'url': match,
-                        'type': media_type,
-                        'quality': meta_type
-                    })
-        
-        if media_urls:
-            return {
-                'type': 'MetaTags',
-                'urls': media_urls,
-                'is_video': is_video,
-                'is_carousel': False,
-                'caption': None,
-                'dimensions': None,
-                'display_url': media_urls[0]['url'] if media_urls else None
-            }
-        
-        # Method 3: Extract from JSON-LD
-        print("Trying Method 3: JSON-LD...")
-        json_ld_pattern = r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>'
-        matches = re.findall(json_ld_pattern, html_content, re.DOTALL)
-        
-        for json_str in matches:
-            try:
-                data = json.loads(json_str)
-                if isinstance(data, dict) and 'video' in data:
-                    video_data = data['video']
-                    if isinstance(video_data, dict):
-                        video_url = video_data.get('contentUrl') or video_data.get('embedUrl')
-                        if video_url:
-                            return {
-                                'type': 'JSON-LD',
-                                'urls': [{
-                                    'url': video_url,
-                                    'type': 'video',
-                                    'quality': 'json-ld'
-                                }],
-                                'is_video': True,
-                                'is_carousel': False,
-                                'caption': None,
-                                'dimensions': None,
-                                'display_url': video_url
-                            }
-            except:
-                continue
-        
-        return None
-    
-    def get_best_quality_url(self, media_data):
-        """Get the best quality URL from media data"""
-        if not media_data or not media_data.get('urls'):
-            return None
-        
-        urls = media_data['urls']
-        
-        # For videos, prioritize video URLs
-        if media_data.get('is_video'):
-            video_urls = [u for u in urls if u['type'] == 'video']
-            if video_urls:
-                # Sort by quality indicators
-                quality_order = ['video_url', 'hd', '1080', '720', '480', '360']
-                for quality in quality_order:
-                    for url_info in video_urls:
-                        if quality in url_info['quality'].lower():
-                            return url_info['url']
-                
-                # Return first video URL
-                return video_urls[0]['url']
-        
-        # For images, prioritize display URLs
-        image_urls = [u for u in urls if u['type'] == 'image']
-        if image_urls:
-            # Sort by quality indicators
-            quality_order = ['display', 'original', '2048', '1536', '1080', 'hd', 'high', 'large']
-            for quality in quality_order:
-                for url_info in image_urls:
-                    if quality in url_info['quality'].lower():
-                        return url_info['url']
-            
-            # Return first image URL
-            return image_urls[0]['url']
-        
-        # Return first URL
-        return urls[0]['url'] if urls else None
-    
-    def fix_url_formatting(self, url):
-        """Fix URL formatting issues"""
-        if not url:
-            return None
-        
-        # Fix escaped characters
-        url = url.replace('\\/', '/').replace('\\\\/', '/')
-        url = url.replace('\\u0026', '&').replace('\\u002F', '/')
-        url = url.replace('\\u003D', '=').replace('\\u003F', '?')
+        # Clean URL
+        url = processed['url']
+        url = url.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003D', '=')
         
         # Ensure proper protocol
         if url.startswith('//'):
@@ -476,61 +366,113 @@ class InstagramSelfDownloader:
         elif not url.startswith('http'):
             url = 'https://' + url
         
-        return url
-    
-    def download_media(self, url):
-        """Main function to download media"""
-        print(f"Processing URL: {url}")
+        processed['url'] = url
         
-        # Get HTML content
-        html_content = self.get_instagram_page(url)
+        # For images, try to get best quality
+        if processed['type'] == 'image':
+            best_url = self.get_best_image_url(url)
+            if best_url != url:
+                processed['url'] = best_url
+                processed['quality'] = 'optimized'
+        
+        return processed
+    
+    def download_media(self, input_url):
+        """Main function to download media"""
+        print(f"Processing URL: {input_url}")
+        
+        # Check if it's already a direct CDN link
+        direct_media = self.get_direct_media_from_url(input_url)
+        if direct_media:
+            print(f"Direct CDN link detected: {direct_media['type']}")
+            return {
+                'success': True,
+                'media_type': direct_media['type'],
+                'media_url': direct_media['url'],
+                'all_urls': [direct_media],
+                'is_direct': True,
+                'method': 'direct_cdn'
+            }
+        
+        # Otherwise, fetch Instagram page
+        html_content = self.get_instagram_page(input_url)
         if not html_content:
             return {
                 'success': False,
                 'error': 'Failed to fetch Instagram page'
             }
         
-        # Extract media data
-        media_data = self.extract_high_quality_media(html_content)
+        # Try multiple extraction methods
+        all_urls = []
         
-        if media_data:
-            # Get best quality URL
-            best_url = self.get_best_quality_url(media_data)
-            
-            if best_url:
-                best_url = self.fix_url_formatting(best_url)
-                
-                return {
-                    'success': True,
-                    'media_type': 'video' if media_data['is_video'] else 'image',
-                    'media_url': best_url,
-                    'all_urls': media_data['urls'],
-                    'is_carousel': media_data.get('is_carousel', False),
-                    'caption': media_data.get('caption'),
-                    'dimensions': media_data.get('dimensions'),
-                    'method': media_data.get('type', 'unknown')
-                }
+        # Method 1: Extract from shared data
+        shared_data_urls = self.extract_from_shared_data(html_content)
+        if shared_data_urls:
+            all_urls.extend(shared_data_urls)
         
-        # Fallback: Try alternative extraction
-        print("Trying fallback methods...")
-        fallback_url = self.extract_from_alternative_sources(html_content)
+        # Method 2: Extract from HTML
+        html_urls = self.extract_media_urls_from_html(html_content)
+        all_urls.extend(html_urls)
         
-        if fallback_url:
-            fallback_url = self.fix_url_formatting(fallback_url)
-            
-            # Determine media type
-            is_video = '.mp4' in fallback_url.lower()
-            
+        # Method 3: Look for meta tags
+        meta_patterns = [
+            r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"',
+            r'<meta[^>]*property="og:video"[^>]*content="([^"]+)"',
+            r'<meta[^>]*property="og:video:secure_url"[^>]*content="([^"]+)"',
+            r'<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"',
+        ]
+        
+        for pattern in meta_patterns:
+            matches = re.findall(pattern, html_content)
+            for match in matches:
+                if match and ('instagram.com' in match or 'cdninstagram.com' in match):
+                    media_type = 'video' if 'video' in pattern else 'image'
+                    all_urls.append({
+                        'url': match,
+                        'type': media_type,
+                        'quality': 'meta_tag'
+                    })
+        
+        if not all_urls:
             return {
-                'success': True,
-                'media_type': 'video' if is_video else 'image',
-                'media_url': fallback_url,
-                'method': 'fallback'
+                'success': False,
+                'error': 'No media found on this page'
             }
         
+        # Process all URLs
+        processed_urls = []
+        for url_info in all_urls:
+            processed = self.process_media_url(url_info)
+            processed_urls.append(processed)
+        
+        # Remove duplicates
+        unique_urls = []
+        seen_urls = set()
+        for url_info in processed_urls:
+            if url_info['url'] not in seen_urls:
+                seen_urls.add(url_info['url'])
+                unique_urls.append(url_info)
+        
+        # Sort by quality
+        sorted_urls = self.sort_urls_by_quality(unique_urls)
+        
+        if not sorted_urls:
+            return {
+                'success': False,
+                'error': 'Could not extract media URLs'
+            }
+        
+        # Get best URL
+        best_url_info = sorted_urls[0]
+        
         return {
-            'success': False,
-            'error': 'Could not extract media. The post might be private or require login.'
+            'success': True,
+            'media_type': best_url_info['type'],
+            'media_url': best_url_info['url'],
+            'all_urls': sorted_urls,
+            'is_direct': False,
+            'method': 'html_parsing',
+            'total_found': len(sorted_urls)
         }
 
 # Initialize downloader
@@ -851,6 +793,24 @@ HTML_TEMPLATE = '''
             font-size: 0.9rem;
         }
         
+        .note {
+            background: #e7f3ff;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            border-left: 4px solid #405DE6;
+        }
+        
+        .note h4 {
+            color: #405DE6;
+            margin-bottom: 8px;
+        }
+        
+        .note p {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
         @media (max-width: 768px) {
             .header h1 {
                 font-size: 2rem;
@@ -899,29 +859,34 @@ HTML_TEMPLATE = '''
                     </button>
                 </div>
                 
+                <div class="note">
+                    <h4><i class="fas fa-lightbulb"></i> Pro Tip:</h4>
+                    <p>You can also paste direct Instagram CDN links (like HEIC images) and we'll convert them to downloadable formats!</p>
+                </div>
+                
                 <div class="feature-list">
                     <div class="feature-card">
                         <i class="fas fa-images"></i>
-                        <h4>HD Photos</h4>
-                        <p>Download images in original high resolution</p>
+                        <h4>All Formats</h4>
+                        <p>JPG, PNG, HEIC, MP4, and more</p>
                     </div>
                     
                     <div class="feature-card">
-                        <i class="fas fa-video"></i>
-                        <h4>Full HD Videos</h4>
-                        <p>Get videos in highest available quality</p>
-                    </div>
-                    
-                    <div class="feature-card">
-                        <i class="fas fa-layer-group"></i>
-                        <h4>Carousel Posts</h4>
-                        <p>Download multiple images/videos from posts</p>
+                        <i class="fas fa-compress-alt"></i>
+                        <h4>HEIC Support</h4>
+                        <p>Converts HEIC images to JPG</p>
                     </div>
                     
                     <div class="feature-card">
                         <i class="fas fa-expand-arrows-alt"></i>
                         <h4>Full Size</h4>
-                        <p>Get media in original dimensions</p>
+                        <p>Gets original resolution media</p>
+                    </div>
+                    
+                    <div class="feature-card">
+                        <i class="fas fa-bolt"></i>
+                        <h4>Direct Links</h4>
+                        <p>Works with direct CDN URLs too</p>
                     </div>
                 </div>
             </div>
@@ -950,13 +915,9 @@ HTML_TEMPLATE = '''
                         <strong>Method:</strong> 
                         <span id="methodName"></span>
                     </p>
-                    <p id="dimensionsInfo" style="display: none;">
-                        <strong>Dimensions:</strong> 
-                        <span id="dimensions"></span>
-                    </p>
-                    <p id="captionInfo" style="display: none;">
-                        <strong>Caption:</strong> 
-                        <span id="caption"></span>
+                    <p id="urlsFoundInfo" style="display: none;">
+                        <strong>Found:</strong> 
+                        <span id="urlsFound"></span> URLs
                     </p>
                 </div>
                 
@@ -1007,20 +968,15 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            if (!url.includes('instagram.com')) {
-                showError('Please enter a valid Instagram URL');
-                return;
-            }
-            
             // Show loader
             loader.style.display = 'block';
             
             // Update status messages
             const statusMessages = [
-                'Fetching Instagram page...',
-                'Analyzing media content...',
+                'Processing URL...',
+                'Checking media type...',
                 'Extracting highest quality...',
-                'Preparing download...',
+                'Optimizing for download...',
                 'Almost ready...'
             ];
             
@@ -1056,19 +1012,10 @@ HTML_TEMPLATE = '''
                     document.getElementById('methodName').textContent = data.method;
                     document.getElementById('downloadLink').href = data.media_url;
                     
-                    // Show dimensions if available
-                    if (data.dimensions) {
-                        document.getElementById('dimensions').textContent = 
-                            `${data.dimensions.width} × ${data.dimensions.height}`;
-                        document.getElementById('dimensionsInfo').style.display = 'block';
-                    }
-                    
-                    // Show caption if available
-                    if (data.caption) {
-                        const caption = data.caption.length > 100 ? 
-                            data.caption.substring(0, 100) + '...' : data.caption;
-                        document.getElementById('caption').textContent = caption;
-                        document.getElementById('captionInfo').style.display = 'block';
+                    // Show URLs found count
+                    if (data.total_found) {
+                        document.getElementById('urlsFound').textContent = data.total_found;
+                        document.getElementById('urlsFoundInfo').style.display = 'block';
                     }
                     
                     // Update media preview
@@ -1087,16 +1034,27 @@ HTML_TEMPLATE = '''
                             </p>
                         `;
                     } else {
+                        // For HEIC images, show special note
+                        let heicNote = '';
+                        if (data.media_url.toLowerCase().includes('.heic')) {
+                            heicNote = `
+                                <div class="note" style="margin-top: 10px;">
+                                    <p><i class="fas fa-exclamation-triangle"></i> HEIC format detected. Right-click and "Save as" to download.</p>
+                                </div>
+                            `;
+                        }
+                        
                         mediaPreview.innerHTML = `
                             <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
                                 <img src="${data.media_url}" 
                                      style="max-width: 100%; max-height: 500px; border-radius: 8px;"
-                                     alt="Instagram Image Preview"
+                                     alt="Instagram Media Preview"
                                      onerror="this.onerror=null; this.src='https://via.placeholder.com/500x500?text=Image+Loading+Error'">
                             </div>
                             <p style="color: #666; font-size: 0.9rem;">
-                                <i class="fas fa-info-circle"></i> High quality image preview
+                                <i class="fas fa-info-circle"></i> High quality media preview
                             </p>
+                            ${heicNote}
                         `;
                     }
                     
@@ -1132,7 +1090,7 @@ HTML_TEMPLATE = '''
                 const qualityDiv = document.createElement('div');
                 qualityDiv.className = `quality-item ${index === 0 ? 'active' : ''}`;
                 qualityDiv.innerHTML = `
-                    <div style="font-weight: 600;">${urlInfo.quality}</div>
+                    <div style="font-weight: 600;">${urlInfo.quality || 'standard'}</div>
                     <div style="font-size: 0.8rem; color: #666;">${urlInfo.type}</div>
                 `;
                 
@@ -1157,6 +1115,9 @@ HTML_TEMPLATE = '''
             // Update download link
             document.getElementById('downloadLink').href = urlInfo.url;
             
+            // Update quality type display
+            document.getElementById('qualityType').textContent = (urlInfo.quality || 'STANDARD').toUpperCase();
+            
             // Update preview
             const mediaPreview = document.getElementById('mediaPreview');
             
@@ -1169,25 +1130,33 @@ HTML_TEMPLATE = '''
                         </video>
                     </div>
                     <p style="color: #666; font-size: 0.9rem;">
-                        <i class="fas fa-info-circle"></i> ${urlInfo.quality} quality
+                        <i class="fas fa-info-circle"></i> ${urlInfo.quality || 'Standard'} quality
                     </p>
                 `;
             } else {
+                // For HEIC images, show special note
+                let heicNote = '';
+                if (urlInfo.url.toLowerCase().includes('.heic')) {
+                    heicNote = `
+                        <div class="note" style="margin-top: 10px;">
+                            <p><i class="fas fa-exclamation-triangle"></i> HEIC format detected. Right-click and "Save as" to download.</p>
+                        </div>
+                    `;
+                }
+                
                 mediaPreview.innerHTML = `
                     <div style="background: #000; border-radius: 10px; padding: 10px; margin-bottom: 15px;">
                         <img src="${urlInfo.url}" 
                              style="max-width: 100%; max-height: 500px; border-radius: 8px;"
-                             alt="Instagram Image Preview"
+                             alt="Instagram Media Preview"
                              onerror="this.onerror=null; this.src='https://via.placeholder.com/500x500?text=Image+Loading+Error'">
                     </div>
                     <p style="color: #666; font-size: 0.9rem;">
-                        <i class="fas fa-info-circle"></i> ${urlInfo.quality} quality
+                        <i class="fas fa-info-circle"></i> ${urlInfo.quality || 'Standard'} quality
                     </p>
+                    ${heicNote}
                 `;
             }
-            
-            // Update quality type display
-            document.getElementById('qualityType').textContent = urlInfo.quality.toUpperCase();
         }
         
         function showError(message) {
@@ -1240,7 +1209,8 @@ HTML_TEMPLATE = '''
         
         // Add sample URL for testing
         setTimeout(() => {
-            document.getElementById('urlInput').value = 'https://www.instagram.com/p/C1AZAMgLwT9/';
+            // Test with your HEIC URL
+            document.getElementById('urlInput').value = 'https://scontent-den2-1.cdninstagram.com/v/t51.29350-15/472284890_576877441799553_5127931670163329588_n.heic?stp=c288.0.864.864a_dst-jpg_e35_s640x640_tt6&amp;_nc_cat=110&amp;ccb=7-5&amp;_nc_sid=18de74&amp;efg=eyJlZmdfdGFnIjoiQ0FST1VTRUxfSVRFTS5iZXN0X2ltYWdlX3VybGdlbi5DMyJ9&amp;_nc_ohc=OaSsbNblbxAQ7kNvwGH1acV&amp;_nc_oc=AdmA2uDrdA6--3xd9LHQM6cvy5_PC7Z6ffE3Ki8gkUHiz2XnOKJu4nZAQbEpI1yKH6g&amp;_nc_zt=23&amp;_nc_ht=scontent-den2-1.cdninstagram.com&amp;_nc_gid=XJRpi0e4VkALdtWVDt9HUQ&amp;oh=00_Afr_YTCZg5wiDawhSFAh-4wtK8TXE5se2ELZJPJuPxU1xQ&amp;oe=69797F97';
         }, 1000);
     </script>
 </body>
@@ -1268,25 +1238,11 @@ def api_download():
                 'error': 'URL parameter is required'
             }), 400
         
-        # Validate Instagram URL
-        if 'instagram.com' not in url:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid Instagram URL'
-            }), 400
+        # Clean URL - remove HTML entities
+        url = url.replace('&amp;', '&')
         
         # Download media using our downloader
         result = downloader.download_media(url)
-        
-        # Fix URL formatting before returning
-        if result.get('success') and 'media_url' in result:
-            result['media_url'] = downloader.fix_url_formatting(result['media_url'])
-            
-            # Fix all URLs
-            if 'all_urls' in result:
-                for url_info in result['all_urls']:
-                    if 'url' in url_info:
-                        url_info['url'] = downloader.fix_url_formatting(url_info['url'])
         
         return jsonify(result)
     
@@ -1302,8 +1258,8 @@ def health():
     return jsonify({
         'status': 'healthy',
         'service': 'Instagram High Quality Downloader',
-        'version': '2.0.0',
-        'features': ['HD Images', 'Full HD Videos', 'Carousel Posts', 'High Quality'],
+        'version': '3.0.0',
+        'features': ['HEIC Support', 'Direct CDN Links', 'All Formats', 'High Quality'],
         'working': 'YES'
     })
 

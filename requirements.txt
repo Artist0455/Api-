@@ -8,3 +8,6 @@ flask-limiter==3.3.1
 youtube-dl==2021.12.17
 yt-dlp==2023.10.13
 instagram-private-api==1.6.0
+python-telegram-bot==20.7
+requests==2.31.0
+python-dotenv==1.0.0
